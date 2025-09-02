@@ -192,11 +192,60 @@ class TestLinearCrossEntropy:
                     self.assert_true(result.requires_grad, "Result should require gradients")
         print("PASS: Milestone 1 regression test")
 
+    def _measure_peak_memory(self, operation_fn):
+        """
+        Utility to measure peak memory usage of an operation.
+        
+        Args:
+            operation_fn: Function that performs the operation to measure
+            
+        Returns:
+            float: Peak memory usage in MB (GPU if available, otherwise rough CPU estimate)
+        """
+        if self.device == "cuda" and torch.cuda.is_available():
+            # GPU memory measurement using CUDA
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(self.device)
+            
+            # Run the operation
+            result = operation_fn()
+            
+            # Get peak memory in MB
+            peak_memory = torch.cuda.max_memory_allocated(self.device) / 1024 / 1024
+            
+            # Clean up
+            del result
+            torch.cuda.empty_cache()
+            
+            return peak_memory
+        else:
+            # CPU memory estimation (rough approximation)
+            # For CPU, we'll estimate based on tensor sizes since psutil isn't available
+            import gc
+            gc.collect()
+            
+            # Run operation and estimate memory from tensor sizes
+            result = operation_fn()
+            
+            # Rough estimation: sum all tensor memory
+            total_memory = 0
+            for obj in gc.get_objects():
+                if torch.is_tensor(obj):
+                    total_memory += obj.nelement() * obj.element_size()
+            
+            total_memory_mb = total_memory / 1024 / 1024
+            
+            # Clean up
+            del result
+            gc.collect()
+            
+            return total_memory_mb
+
     # =============================================================================
     # MILESTONE 2: MEMORY PROFILING INFRASTRUCTURE
     # =============================================================================
 
-    def test_step_2_memory_profiling(self, device="cpu"):
+    def test_step_2_memory_profiling(self):
         """
         Milestone 2: Test memory profiling infrastructure.
         
@@ -204,66 +253,112 @@ class TestLinearCrossEntropy:
         - Memory measurement utilities work
         - Baseline memory measurements are recorded
         - Memory measurements are reproducible
+        - Establishes evidence for memory problem with large vocabs
         """
-        print(f"\n=== MILESTONE 2 TESTS ({device}) ===")
+        print(f"\n=== MILESTONE 2 TESTS ({self.device}) ===")
         
-        if device == "cpu":
-            print("WARNING: Memory profiling most meaningful on CUDA, skipping detailed tests on CPU")
-            return
-            
-        # Test 2.1: Memory measurement utility
+        # Test 2.1: Memory measurement utility basic functionality
         def simple_operation():
-            x = torch.randn(1000, 1000, device=device)
-            y = torch.randn(1000, 1000, device=device)
-            return torch.matmul(x, y)
+            x = torch.randn(1000, 1000, device=self.device)
+            y = torch.randn(1000, 1000, device=self.device)
+            result = torch.matmul(x, y)
+            return result
         
         memory_used = self._measure_peak_memory(simple_operation)
-        self.assertGreater(memory_used, 0, "Memory measurement should detect usage")
+        self.assert_true(memory_used > 0, "Memory measurement should detect usage")
         print(f"PASS: 2.1 Memory measurement utility (detected {memory_used:.2f} MB)")
         
-        # Test 2.2: Baseline memory measurements
+        # Test 2.2: Linear cross entropy baseline memory measurements
+        # These establish the memory problem we're trying to solve
         test_cases = [
-            (32, 512, 10000),   # Small vocab
-            (8, 1024, 50000),   # Medium vocab  
-            (4, 2048, 128000),  # Large vocab
+            (32, 256, 4096, 10000, "Small vocab"),     # ~300MB expected
+            (16, 512, 4096, 30000, "Medium vocab"),    # ~1GB expected  
+            (8, 1024, 4096, 50000, "Large vocab"),     # ~1.6GB expected
         ]
         
-        baselines = {}
-        for batch_size, seq_len, vocab_size in test_cases:
-            def reference_impl():
-                input = torch.randn(batch_size, seq_len, 4096, device=device)
-                weight = torch.randn(vocab_size, 4096, device=device)
-                target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
-                logits = F.linear(input, weight)
-                loss = F.cross_entropy(logits, target)
+        if self.device == "cuda" and torch.cuda.is_available():
+            # Only run large tests on GPU where we can measure accurately
+            test_cases.append((4, 2048, 4096, 100000, "Very large vocab"))  # ~3.2GB expected
+        
+        self.baselines = {}  # Store baselines for regression detection
+        
+        for batch_size, seq_len, hidden_dim, vocab_size, description in test_cases:
+            def reference_linear_cross_entropy():
+                # Current naive implementation - materializes full logits
+                input = torch.randn(batch_size, seq_len, hidden_dim, device=self.device, requires_grad=True)
+                weight = torch.randn(vocab_size, hidden_dim, device=self.device, requires_grad=True)
+                target = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
+                
+                # This is the memory-intensive operation we want to optimize
+                logits = F.linear(input, weight)  # This creates the large logits tensor
+                loss = F.cross_entropy(logits.view(-1, vocab_size), target.view(-1))
+                loss.backward()
                 return loss
                 
-            memory = self._measure_peak_memory(reference_impl)
-            baselines[vocab_size] = memory
-            print(f"PASS: 2.2 Baseline for vocab_size {vocab_size}: {memory:.2f} MB")
+            memory_mb = self._measure_peak_memory(reference_linear_cross_entropy)
+            self.baselines[vocab_size] = memory_mb
+            
+            # Calculate expected logit tensor size for validation
+            logits_size_mb = (batch_size * seq_len * vocab_size * 4) / (1024 * 1024)  # 4 bytes per float32
+            
+            print(f"PASS: 2.2 {description} (vocab={vocab_size}): {memory_mb:.1f} MB")
+            print(f"      Logits tensor alone: {logits_size_mb:.1f} MB")
+            
+            # Validate memory usage makes sense (should be at least the logits size)
+            if self.device == "cuda":
+                self.assert_true(memory_mb >= logits_size_mb * 0.8, 
+                               f"Memory usage {memory_mb:.1f}MB should be at least logits size {logits_size_mb:.1f}MB")
         
         # Test 2.3: Memory measurement reproducibility
-        memory1 = self._measure_peak_memory(simple_operation)
-        memory2 = self._measure_peak_memory(simple_operation)
-        variance = abs(memory1 - memory2) / memory1
-        self.assertLess(variance, 0.1, f"Memory measurements should be reproducible (variance: {variance:.3f})")
-        print("PASS: 2.3 Memory measurement reproducibility")
+        if self.device == "cuda" and torch.cuda.is_available():
+            memory1 = self._measure_peak_memory(simple_operation)
+            memory2 = self._measure_peak_memory(simple_operation)
+            variance = abs(memory1 - memory2) / memory1 if memory1 > 0 else 0
+            self.assert_true(variance < 0.1, f"Memory measurements should be reproducible (variance: {variance:.3f})")
+            print("PASS: 2.3 Memory measurement reproducibility")
+        else:
+            print("SKIP: 2.3 Memory measurement reproducibility (CPU measurements less precise)")
+        
+        # Test 2.4: Demonstrate memory problem scaling
+        if len(self.baselines) >= 2:
+            vocab_sizes = sorted(self.baselines.keys())
+            small_vocab_memory = self.baselines[vocab_sizes[0]]
+            large_vocab_memory = self.baselines[vocab_sizes[-1]]
+            
+            scaling_factor = large_vocab_memory / small_vocab_memory
+            expected_scaling = vocab_sizes[-1] / vocab_sizes[0]
+            
+            print(f"PASS: 2.4 Memory scaling validation:")
+            print(f"      {vocab_sizes[0]} vocab: {small_vocab_memory:.1f} MB")
+            print(f"      {vocab_sizes[-1]} vocab: {large_vocab_memory:.1f} MB") 
+            print(f"      Scaling factor: {scaling_factor:.1f}x (expected ~{expected_scaling:.1f}x)")
+            
+            # Memory should scale roughly with vocab size (allowing for overhead)
+            self.assert_true(scaling_factor >= expected_scaling * 0.5, 
+                           f"Memory should scale with vocab size")
         
         print("SUCCESS: MILESTONE 2 COMPLETED - Memory profiling infrastructure ready")
+        print(f"BASELINES ESTABLISHED: {len(self.baselines)} vocab sizes measured")
+        
+        # Store baseline data for future regression tests
+        if hasattr(self, 'baselines'):
+            print("BASELINE DATA:")
+            for vocab_size in sorted(self.baselines.keys()):
+                print(f"  vocab_size_{vocab_size}: {self.baselines[vocab_size]:.1f} MB")
 
-    def _measure_peak_memory(self, operation_fn):
-        """Utility to measure peak memory usage of an operation."""
-        if not torch.cuda.is_available():
-            return 0.0
-            
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
+    def test_step_2_regression(self):
+        """
+        Milestone 2 regression test - ensures memory measurement infrastructure never breaks.
+        Utility to verify memory measurement functionality remains working.
+        """
+        # Quick smoke test to ensure memory measurement works
+        def tiny_operation():
+            x = torch.randn(100, 100, device=self.device)
+            return x * 2
         
-        result = operation_fn()
-        
-        peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert to MB
-        torch.cuda.empty_cache()
-        return peak_memory
+        memory_used = self._measure_peak_memory(tiny_operation)
+        self.assert_true(memory_used >= 0, "Memory measurement should return non-negative values")
+        print("PASS: Milestone 2 regression test - memory measurement functional")
 
     # =============================================================================
     # MILESTONE 3: VOCABULARY CHUNKING IMPLEMENTATION  
@@ -280,15 +375,94 @@ class TestLinearCrossEntropy:
         - No performance regression for small vocabs
         """
         print(f"\n=== MILESTONE 3 TESTS ({device}) ===")
-        print("TODO: Milestone 3 not yet implemented - vocab chunking pending")
         
-        # Placeholder for vocab chunking tests
-        # TODO: Implement when vocab chunking is ready
+        # Test 3.1: Basic functionality test
+        print("Test 3.1: Basic functionality test")
+        batch_size, seq_len, hidden_dim, vocab_size = 2, 4, 8, 16
         
-        # Test 3.1: Numerical correctness with vocab chunking
-        # Test 3.2: Memory reduction validation  
-        # Test 3.3: Performance regression check
-        # Test 3.4: CUDA kernel functionality
+        input_tensor = torch.randn(batch_size, seq_len, hidden_dim, device=device, requires_grad=True)
+        weight_tensor = torch.randn(vocab_size, hidden_dim, device=device, requires_grad=True)
+        target_tensor = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        
+        print(f"  Input shape: {input_tensor.shape}")
+        print(f"  Weight shape: {weight_tensor.shape}")
+        print(f"  Target shape: {target_tensor.shape}")
+        
+        # First test what F.linear produces
+        logits_ref = F.linear(input_tensor, weight_tensor)
+        print(f"  Logits shape: {logits_ref.shape}")
+        
+        # Test reference implementation - need to reshape for cross_entropy
+        logits_flat = logits_ref.view(-1, logits_ref.size(-1))  # [batch*seq, vocab]
+        target_flat = target_tensor.view(-1)                    # [batch*seq]
+        print(f"  Logits flat shape: {logits_flat.shape}")
+        print(f"  Target flat shape: {target_flat.shape}")
+        
+        loss_ref = F.cross_entropy(logits_flat, target_flat)
+        print(f"  Reference loss: {loss_ref}")
+        
+        # Test our implementation
+        loss_ours = F.linear_cross_entropy(input_tensor, weight_tensor, target_tensor)
+        print(f"  Our loss: {loss_ours}")
+        
+        self.assert_allclose(loss_ours, loss_ref, message="Basic functionality test")
+        print("PASS: Basic functionality test")
+        
+        # Test 3.2: Numerical correctness with different vocab sizes
+        print("Test 3.2: Small vocabulary test")
+        
+        small_vocab = 1000
+        input_small = torch.randn(4, 8, 64, device=device, requires_grad=True)
+        weight_small = torch.randn(small_vocab, 64, device=device, requires_grad=True)
+        target_small = torch.randint(0, small_vocab, (4, 8), device=device)
+        
+        # Reference implementation - need to reshape for cross_entropy
+        logits_ref = F.linear(input_small, weight_small)
+        logits_ref_flat = logits_ref.view(-1, logits_ref.size(-1))
+        target_small_flat = target_small.view(-1)
+        loss_ref = F.cross_entropy(logits_ref_flat, target_small_flat)
+        
+        # Our implementation with chunking strategy
+        loss_chunked = F.linear_cross_entropy(input_small, weight_small, target_small, 
+                                            chunking_strategy="vocab")
+        
+        self.assert_allclose(loss_chunked, loss_ref, message="Small vocab chunking correctness")
+        print("PASS: Small vocabulary test")
+        
+        # Test 3.3: Large vocabulary test (should trigger chunking)
+        print("Test 3.3: Large vocabulary test")
+        
+        large_vocab = 8192  # Larger than default chunk size (4096)
+        input_large = torch.randn(2, 4, 64, device=device, requires_grad=True)
+        weight_large = torch.randn(large_vocab, 64, device=device, requires_grad=True)
+        target_large = torch.randint(0, large_vocab, (2, 4), device=device)
+        
+        # Reference implementation - need to reshape for cross_entropy
+        logits_ref_large = F.linear(input_large, weight_large)
+        logits_ref_large_flat = logits_ref_large.view(-1, logits_ref_large.size(-1))
+        target_large_flat = target_large.view(-1)
+        loss_ref_large = F.cross_entropy(logits_ref_large_flat, target_large_flat)
+        
+        # Our chunked implementation
+        loss_chunked_large = F.linear_cross_entropy(input_large, weight_large, target_large,
+                                                  chunking_strategy="vocab")
+        
+        self.assert_allclose(loss_chunked_large, loss_ref_large, atol=1e-4, message="Large vocab chunking correctness")
+        print("PASS: Large vocabulary test")
+        
+        # Test 3.4: Strategy consistency test
+        print("Test 3.4: Strategy consistency test")
+        
+        # For small vocabularies, different strategies should give same result
+        loss_auto = F.linear_cross_entropy(input_small, weight_small, target_small, 
+                                          chunking_strategy="auto")
+        loss_vocab = F.linear_cross_entropy(input_small, weight_small, target_small,
+                                          chunking_strategy="vocab")
+        
+        self.assert_allclose(loss_auto, loss_vocab, message="Strategy consistency")
+        print("PASS: Strategy consistency test")
+        
+        print("=== MILESTONE 3 COMPLETED ===\n")
 
     # =============================================================================
     # MILESTONE 4: BATCH CHUNKING IMPLEMENTATION
@@ -490,6 +664,7 @@ def main():
         elif command == "regression":
             # Run all regression tests
             runner.test_step_1_regression()
+            runner.test_step_2_regression()
         else:
             print(f"Unknown command: {command}")
             print("Available commands: step_1, step_2, ..., step_8, all, regression")

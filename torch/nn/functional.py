@@ -3539,9 +3539,14 @@ def linear_cross_entropy(
     # For now, implement naive fallback using separate linear + cross_entropy
     # This will be replaced with optimized implementations in subsequent milestones
     logits = torch.nn.functional.linear(input, weight, bias)
+    
+    # Reshape tensors for cross_entropy: logits [N, C] and target [N]
+    logits_flat = logits.view(-1, logits.size(-1))  # [N, C]
+    target_flat = target.view(-1)                   # [N]
+    
     return torch.nn.functional.cross_entropy(
-        logits, 
-        target, 
+        logits_flat, 
+        target_flat, 
         reduction=reduction, 
         ignore_index=ignore_index,
         label_smoothing=label_smoothing
