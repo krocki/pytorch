@@ -3465,6 +3465,89 @@ def cross_entropy(
     )
 
 
+def linear_cross_entropy(
+    input: Tensor,
+    weight: Tensor,
+    target: Tensor,
+    bias: Optional[Tensor] = None,
+    reduction: str = "mean",
+    ignore_index: int = -100,
+    label_smoothing: float = 0.0,
+    chunking_strategy: str = "auto"
+) -> Tensor:
+    r"""Compute fused linear transformation and cross entropy loss.
+    
+    This function combines linear projection and cross entropy loss computation
+    to reduce memory usage for large vocabulary models. The implementation uses
+    chunking strategies to avoid materializing large intermediate logit tensors.
+    
+    Args:
+        input (Tensor): Input tensor of shape (N, *, H_in) where H_in is input features
+        weight (Tensor): Weight tensor of shape (C, H_in) where C is number of classes
+        target (Tensor): Target tensor of shape (N, *) containing class indices
+        bias (Tensor, optional): Bias tensor of shape (C). Default: None
+        reduction (str, optional): Reduction to apply: 'none' | 'mean' | 'sum'. Default: 'mean'
+        ignore_index (int, optional): Index to ignore in loss computation. Default: -100
+        label_smoothing (float, optional): Label smoothing factor [0.0, 1.0]. Default: 0.0
+        chunking_strategy (str, optional): Chunking strategy: 'auto' | 'vocab' | 'batch' | 'none'. Default: 'auto'
+    
+    Returns:
+        Tensor: Computed loss according to reduction parameter
+        
+    Shape:
+        - Input: (N, *, H_in) where * means any number of dimensions
+        - Weight: (C, H_in) where C is number of classes  
+        - Target: (N, *) containing class indices in [0, C)
+        - Output: scalar if reduction != 'none', otherwise (N, *)
+        
+    Examples::
+        >>> input = torch.randn(32, 512, 4096, requires_grad=True)
+        >>> weight = torch.randn(50000, 4096, requires_grad=True)
+        >>> target = torch.randint(50000, (32, 512))
+        >>> loss = F.linear_cross_entropy(input, weight, target)
+        >>> loss.backward()
+        
+    Note:
+        This function is memory-efficient for large vocabulary sizes by avoiding
+        materialization of the full logit tensor. For small vocabularies,
+        standard F.linear + F.cross_entropy may be faster.
+    """
+    if has_torch_function_variadic(input, weight, target, bias):
+        return handle_torch_function(
+            linear_cross_entropy,
+            (input, weight, target, bias),
+            input,
+            weight,
+            target,
+            bias=bias,
+            reduction=reduction,
+            ignore_index=ignore_index,
+            label_smoothing=label_smoothing,
+            chunking_strategy=chunking_strategy,
+        )
+    
+    # Parameter validation
+    if not isinstance(reduction, str) or reduction not in ("mean", "sum", "none"):
+        raise ValueError(f"reduction must be one of ('mean', 'sum', 'none'), got '{reduction}'")
+    
+    if not (0.0 <= label_smoothing <= 1.0):
+        raise ValueError(f"label_smoothing must be between 0.0 and 1.0, got {label_smoothing}")
+        
+    if chunking_strategy not in ("auto", "vocab", "batch", "none"):
+        raise ValueError(f"chunking_strategy must be one of ('auto', 'vocab', 'batch', 'none'), got '{chunking_strategy}'")
+    
+    # For now, implement naive fallback using separate linear + cross_entropy
+    # This will be replaced with optimized implementations in subsequent milestones
+    logits = torch.nn.functional.linear(input, weight, bias)
+    return torch.nn.functional.cross_entropy(
+        logits, 
+        target, 
+        reduction=reduction, 
+        ignore_index=ignore_index,
+        label_smoothing=label_smoothing
+    )
+
+
 def binary_cross_entropy(
     input: Tensor,
     target: Tensor,

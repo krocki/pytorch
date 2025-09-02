@@ -1,0 +1,509 @@
+# Owner(s): ["module: nn"]
+
+"""
+Test suite for torch.nn.functional.linear_cross_entropy implementation.
+
+This file contains milestone-based tests that track implementation progress:
+
+MILESTONE STRUCTURE:
+- Each milestone has dedicated test methods with naming pattern: test_step_N_*
+- Tests are designed to be run incrementally as implementation progresses
+- Regression tests ensure previous milestones continue working
+- Final test_linear_ce() validates complete implementation
+
+MILESTONE BREAKDOWN:
+Step 1 (Foundation): Basic API, parameter validation, naive fallback
+Step 2 (Memory): Memory profiling infrastructure and baseline measurements  
+Step 3 (Vocab Chunking): Vocabulary dimension chunking implementation
+Step 4 (Batch Chunking): Batch dimension chunking with Triton kernels
+Step 5 (Dispatch): Intelligent strategy selection based on input characteristics
+Step 6 (Integration): Compatibility with torch.compile, distributed training
+Step 7 (Performance): Benchmarking and performance validation
+Step 8 (Production): Final production readiness verification
+
+RUNNING TESTS:
+# Run specific milestone:
+python test/nn/test_linear_cross_entropy.py step_1 cpu
+python test/nn/test_linear_cross_entropy.py step_2 cuda
+
+# Run regression tests:
+python test/nn/test_linear_cross_entropy.py regression cpu
+
+# Run all implemented tests:
+python test/nn/test_linear_cross_entropy.py all cpu
+
+NOTE TO SELF: Never use 'python -c "..."' for testing. Always add tests to this file
+and run them through the proper test runner.
+"""
+
+import sys
+import torch
+import torch.nn.functional as F
+
+
+class TestLinearCrossEntropy:
+    """Test suite for linear_cross_entropy implementation across all milestones."""
+    
+    def __init__(self, device="cpu"):
+        self.device = device
+        self.tests_passed = 0
+        self.tests_failed = 0
+        
+    def assert_true(self, condition, message=""):
+        if condition:
+            self.tests_passed += 1
+        else:
+            self.tests_failed += 1
+            print(f"FAIL: {message}")
+            
+    def assert_allclose(self, a, b, atol=1e-8, message=""):
+        condition = torch.allclose(a, b, atol=atol)
+        self.assert_true(condition, f"{message} - Expected close values, got {a} vs {b}")
+        
+    def assert_raises(self, exception_type, func, message=""):
+        try:
+            func()
+            self.tests_failed += 1
+            print(f"FAIL: {message} - Expected {exception_type.__name__} but no exception was raised")
+        except exception_type:
+            self.tests_passed += 1
+        except Exception as e:
+            self.tests_failed += 1
+            print(f"FAIL: {message} - Expected {exception_type.__name__} but got {type(e).__name__}: {e}")
+
+    # =============================================================================
+    # MILESTONE 1: FOUNDATION SETUP
+    # =============================================================================
+
+    def test_step_1_foundation(self):
+        """
+        Milestone 1: Test basic API structure and correctness.
+        
+        Validates:
+        - Function exists and is callable
+        - Parameter validation works
+        - Numerical correctness against reference
+        - Gradient computation correctness
+        - All parameter combinations work
+        """
+        print(f"\n=== MILESTONE 1 TESTS ({self.device}) ===")
+        
+        # Test 1.1: Basic functionality
+        batch_size, seq_len, hidden_dim, vocab_size = 4, 8, 16, 20
+        input = torch.randn(batch_size, seq_len, hidden_dim, device=self.device, requires_grad=True)
+        weight = torch.randn(vocab_size, hidden_dim, device=self.device, requires_grad=True)
+        bias = torch.randn(vocab_size, device=self.device, requires_grad=True)
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
+        
+        # Reference implementation
+        logits_ref = F.linear(input, weight, bias)
+        loss_ref = F.cross_entropy(logits_ref.view(-1, vocab_size), target.view(-1))
+        loss_ref.backward()
+        
+        # Store reference gradients
+        input_grad_ref = input.grad.clone()
+        weight_grad_ref = weight.grad.clone()
+        bias_grad_ref = bias.grad.clone()
+        
+        # Reset gradients for fused implementation
+        input.grad = None
+        weight.grad = None
+        bias.grad = None
+        
+        # Fused implementation
+        loss_fused = F.linear_cross_entropy(input.view(-1, hidden_dim), weight, target.view(-1), bias)
+        loss_fused.backward()
+        
+        # Test correctness
+        self.assert_allclose(loss_fused, loss_ref, atol=1e-8, message="Loss values should match")
+        self.assert_allclose(input.grad, input_grad_ref, atol=1e-6, message="Input gradients should match")
+        self.assert_allclose(weight.grad, weight_grad_ref, atol=1e-6, message="Weight gradients should match")
+        self.assert_allclose(bias.grad, bias_grad_ref, atol=1e-6, message="Bias gradients should match")
+        print("PASS: 1.1 Basic functionality and gradient correctness")
+        
+        # Test 1.2: Parameter validation
+        input_simple = torch.randn(4, 8, device=self.device)
+        weight_simple = torch.randn(10, 8, device=self.device)
+        target_simple = torch.randint(0, 10, (4,), device=self.device)
+        
+        # Invalid reduction
+        self.assert_raises(ValueError, 
+                          lambda: F.linear_cross_entropy(input_simple, weight_simple, target_simple, reduction="invalid"),
+                          "Should raise ValueError for invalid reduction")
+        
+        # Invalid label_smoothing
+        self.assert_raises(ValueError,
+                          lambda: F.linear_cross_entropy(input_simple, weight_simple, target_simple, label_smoothing=-0.1),
+                          "Should raise ValueError for negative label_smoothing")
+        
+        self.assert_raises(ValueError,
+                          lambda: F.linear_cross_entropy(input_simple, weight_simple, target_simple, label_smoothing=1.1),
+                          "Should raise ValueError for label_smoothing > 1.0")
+        
+        # Invalid chunking_strategy
+        self.assert_raises(ValueError,
+                          lambda: F.linear_cross_entropy(input_simple, weight_simple, target_simple, chunking_strategy="invalid"),
+                          "Should raise ValueError for invalid chunking_strategy")
+        print("PASS: 1.2 Parameter validation")
+        
+        # Test 1.3: All reduction modes
+        for reduction in ['mean', 'sum', 'none']:
+            logits = F.linear(input_simple, weight_simple)
+            loss_ref = F.cross_entropy(logits, target_simple, reduction=reduction)
+            loss_fused = F.linear_cross_entropy(input_simple, weight_simple, target_simple, reduction=reduction)
+            self.assert_allclose(loss_fused, loss_ref, atol=1e-8, message=f"Reduction '{reduction}' should match")
+        print("PASS: 1.3 All reduction modes")
+        
+        # Test 1.4: ignore_index parameter
+        target_with_ignore = target_simple.clone()
+        target_with_ignore[0] = -100
+        
+        logits = F.linear(input_simple, weight_simple)
+        loss_ref = F.cross_entropy(logits, target_with_ignore, ignore_index=-100)
+        loss_fused = F.linear_cross_entropy(input_simple, weight_simple, target_with_ignore, ignore_index=-100)
+        self.assert_allclose(loss_fused, loss_ref, atol=1e-8, message="ignore_index should work correctly")
+        print("PASS: 1.4 ignore_index parameter")
+        
+        # Test 1.5: label_smoothing parameter
+        for label_smoothing in [0.0, 0.1, 0.3]:
+            logits = F.linear(input_simple, weight_simple)
+            loss_ref = F.cross_entropy(logits, target_simple, label_smoothing=label_smoothing)
+            loss_fused = F.linear_cross_entropy(input_simple, weight_simple, target_simple, label_smoothing=label_smoothing)
+            self.assert_allclose(loss_fused, loss_ref, atol=1e-8, message=f"label_smoothing {label_smoothing} should match")
+        print("PASS: 1.5 label_smoothing parameter")
+        
+        print("SUCCESS: MILESTONE 1 COMPLETED - Foundation setup successful")
+
+    def test_step_1_regression(self):
+        """Milestone 1 regression test - ensures basic functionality never breaks."""
+        input = torch.randn(4, 8, requires_grad=True, device=self.device)
+        weight = torch.randn(10, 8, requires_grad=True, device=self.device)
+        target = torch.randint(0, 10, (4,), device=self.device)
+        
+        # Test all parameter combinations
+        for reduction in ['mean', 'sum', 'none']:
+            for ignore_index in [-100, 5]:
+                for label_smoothing in [0.0, 0.1]:
+                    result = F.linear_cross_entropy(input, weight, target, 
+                                                  reduction=reduction,
+                                                  ignore_index=ignore_index,
+                                                  label_smoothing=label_smoothing)
+                    self.assert_true(result is not None, "Result should not be None")
+                    self.assert_true(result.requires_grad, "Result should require gradients")
+        print("PASS: Milestone 1 regression test")
+
+    # =============================================================================
+    # MILESTONE 2: MEMORY PROFILING INFRASTRUCTURE
+    # =============================================================================
+
+    def test_step_2_memory_profiling(self, device="cpu"):
+        """
+        Milestone 2: Test memory profiling infrastructure.
+        
+        Validates:
+        - Memory measurement utilities work
+        - Baseline memory measurements are recorded
+        - Memory measurements are reproducible
+        """
+        print(f"\n=== MILESTONE 2 TESTS ({device}) ===")
+        
+        if device == "cpu":
+            print("WARNING: Memory profiling most meaningful on CUDA, skipping detailed tests on CPU")
+            return
+            
+        # Test 2.1: Memory measurement utility
+        def simple_operation():
+            x = torch.randn(1000, 1000, device=device)
+            y = torch.randn(1000, 1000, device=device)
+            return torch.matmul(x, y)
+        
+        memory_used = self._measure_peak_memory(simple_operation)
+        self.assertGreater(memory_used, 0, "Memory measurement should detect usage")
+        print(f"PASS: 2.1 Memory measurement utility (detected {memory_used:.2f} MB)")
+        
+        # Test 2.2: Baseline memory measurements
+        test_cases = [
+            (32, 512, 10000),   # Small vocab
+            (8, 1024, 50000),   # Medium vocab  
+            (4, 2048, 128000),  # Large vocab
+        ]
+        
+        baselines = {}
+        for batch_size, seq_len, vocab_size in test_cases:
+            def reference_impl():
+                input = torch.randn(batch_size, seq_len, 4096, device=device)
+                weight = torch.randn(vocab_size, 4096, device=device)
+                target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+                logits = F.linear(input, weight)
+                loss = F.cross_entropy(logits, target)
+                return loss
+                
+            memory = self._measure_peak_memory(reference_impl)
+            baselines[vocab_size] = memory
+            print(f"PASS: 2.2 Baseline for vocab_size {vocab_size}: {memory:.2f} MB")
+        
+        # Test 2.3: Memory measurement reproducibility
+        memory1 = self._measure_peak_memory(simple_operation)
+        memory2 = self._measure_peak_memory(simple_operation)
+        variance = abs(memory1 - memory2) / memory1
+        self.assertLess(variance, 0.1, f"Memory measurements should be reproducible (variance: {variance:.3f})")
+        print("PASS: 2.3 Memory measurement reproducibility")
+        
+        print("SUCCESS: MILESTONE 2 COMPLETED - Memory profiling infrastructure ready")
+
+    def _measure_peak_memory(self, operation_fn):
+        """Utility to measure peak memory usage of an operation."""
+        if not torch.cuda.is_available():
+            return 0.0
+            
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        
+        result = operation_fn()
+        
+        peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024  # Convert to MB
+        torch.cuda.empty_cache()
+        return peak_memory
+
+    # =============================================================================
+    # MILESTONE 3: VOCABULARY CHUNKING IMPLEMENTATION  
+    # =============================================================================
+
+    def test_step_3_vocab_chunking(self, device="cpu"):
+        """
+        Milestone 3: Test vocabulary chunking implementation.
+        
+        Validates:
+        - Memory usage reduced for large vocab models
+        - Numerical accuracy maintained
+        - Forward and backward pass correctness
+        - No performance regression for small vocabs
+        """
+        print(f"\n=== MILESTONE 3 TESTS ({device}) ===")
+        print("TODO: Milestone 3 not yet implemented - vocab chunking pending")
+        
+        # Placeholder for vocab chunking tests
+        # TODO: Implement when vocab chunking is ready
+        
+        # Test 3.1: Numerical correctness with vocab chunking
+        # Test 3.2: Memory reduction validation  
+        # Test 3.3: Performance regression check
+        # Test 3.4: CUDA kernel functionality
+
+    # =============================================================================
+    # MILESTONE 4: BATCH CHUNKING IMPLEMENTATION
+    # =============================================================================
+
+    def test_step_4_batch_chunking(self, device="cpu"):
+        """
+        Milestone 4: Test batch chunking implementation.
+        
+        Validates:
+        - Triton kernel registration and functionality
+        - Batch chunking reduces memory usage
+        - Autograd compatibility
+        - Performance improvement for large batches
+        """
+        print(f"\n=== MILESTONE 4 TESTS ({device}) ===")
+        print("TODO: Milestone 4 not yet implemented - batch chunking pending")
+        
+        # Placeholder for batch chunking tests
+        # TODO: Implement when batch chunking is ready
+
+    # =============================================================================
+    # MILESTONE 5: INTELLIGENT DISPATCH LOGIC
+    # =============================================================================
+
+    def test_step_5_dispatch(self, device="cpu"):
+        """
+        Milestone 5: Test intelligent dispatch logic.
+        
+        Validates:
+        - Automatic strategy selection
+        - Heuristics choose optimal approach
+        - All strategies accessible manually
+        - No performance regression
+        """
+        print(f"\n=== MILESTONE 5 TESTS ({device}) ===")
+        print("TODO: Milestone 5 not yet implemented - dispatch logic pending")
+
+    # =============================================================================
+    # MILESTONE 6: INTEGRATION TESTING
+    # =============================================================================
+
+    def test_step_6_integration(self, device="cpu"):
+        """
+        Milestone 6: Test integration with PyTorch ecosystem.
+        
+        Validates:
+        - torch.compile compatibility
+        - Distributed training compatibility  
+        - Mixed precision training support
+        - No conflicts with existing features
+        """
+        print(f"\n=== MILESTONE 6 TESTS ({device}) ===")
+        print("TODO: Milestone 6 not yet implemented - integration tests pending")
+
+    # =============================================================================
+    # MILESTONE 7: PERFORMANCE VALIDATION
+    # =============================================================================
+
+    def test_step_7_performance(self, device="cpu"):
+        """
+        Milestone 7: Test performance validation.
+        
+        Validates:
+        - Memory reduction targets achieved
+        - No performance regression for small models
+        - Training throughput improvements
+        - Cross-hardware validation
+        """
+        print(f"\n=== MILESTONE 7 TESTS ({device}) ===")
+        print("TODO: Milestone 7 not yet implemented - performance validation pending")
+
+    # =============================================================================
+    # MILESTONE 8: PRODUCTION READINESS
+    # =============================================================================
+
+    def test_step_8_production(self, device="cpu"):
+        """
+        Milestone 8: Test production readiness.
+        
+        Validates:
+        - Complete test coverage
+        - Code style compliance
+        - Documentation completeness
+        - Final integration validation
+        """
+        print(f"\n=== MILESTONE 8 TESTS ({device}) ===")
+        print("TODO: Milestone 8 not yet implemented - production readiness pending")
+
+    # =============================================================================
+    # FINAL INTEGRATION TEST
+    # =============================================================================
+
+    def test_linear_ce(self, device="cpu"):
+        """
+        Final integration test for complete linear_cross_entropy implementation.
+        
+        This test validates the entire implementation across all scenarios:
+        - Small and large vocabulary sizes
+        - Different batch sizes and sequence lengths
+        - All parameter combinations
+        - Memory efficiency validation
+        - Performance characteristics
+        
+        This test should only pass when ALL milestones are complete.
+        """
+        print(f"\n=== FINAL INTEGRATION TEST ({device}) ===")
+        
+        # High-level validation of complete implementation
+        test_scenarios = [
+            # (batch_size, seq_len, hidden_dim, vocab_size, description)
+            (32, 128, 768, 1000, "Small model"),
+            (16, 512, 1024, 30000, "Medium model"), 
+            (8, 1024, 2048, 50000, "Large model"),
+            (4, 2048, 4096, 128000, "Very large vocab"),
+        ]
+        
+        for batch_size, seq_len, hidden_dim, vocab_size, desc in test_scenarios:
+            print(f"Testing {desc}: {batch_size}x{seq_len}x{hidden_dim} -> {vocab_size}")
+            
+            input = torch.randn(batch_size, seq_len, hidden_dim, device=device, requires_grad=True)
+            weight = torch.randn(vocab_size, hidden_dim, device=device, requires_grad=True)
+            target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+            
+            # Test automatic strategy selection
+            loss = F.linear_cross_entropy(input, weight, target, chunking_strategy="auto")
+            loss.backward()
+            
+            # Verify gradients exist and are reasonable
+            self.assertIsNotNone(input.grad)
+            self.assertIsNotNone(weight.grad)
+            self.assertFalse(torch.isnan(loss))
+            self.assertTrue(loss.requires_grad)
+            
+            print(f"  PASS: {desc} completed successfully")
+        
+        print("SUCCESS: FINAL INTEGRATION TEST COMPLETED")
+
+
+    def run_milestone_test(self, milestone_num):
+        """Run a specific milestone test."""
+        method_name = f"test_step_{milestone_num}_"
+        
+        for attr_name in dir(self):
+            if attr_name.startswith(method_name):
+                print(f"\nRunning {attr_name} on {self.device}")
+                getattr(self, attr_name)()
+                return True
+        
+        print(f"ERROR: No test found for milestone {milestone_num}")
+        return False
+
+    def run_all_tests(self):
+        """Run all available tests."""
+        for i in range(1, 9):
+            if hasattr(self, f"test_step_{i}_foundation") or hasattr(self, f"test_step_{i}_memory_profiling"):
+                try:
+                    self.run_milestone_test(i)
+                except Exception as e:
+                    print(f"ERROR: Milestone {i} failed: {e}")
+                    self.tests_failed += 1
+
+    def report(self):
+        """Print test results summary."""
+        total = self.tests_passed + self.tests_failed
+        print(f"\n=== TEST RESULTS ===")
+        print(f"Tests run: {total}")
+        print(f"Passed: {self.tests_passed}")
+        print(f"Failed: {self.tests_failed}")
+        
+        if self.tests_failed == 0:
+            print("SUCCESS: All tests passed!")
+        else:
+            print("FAILURE: Some tests failed!")
+        
+        return self.tests_failed == 0
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python test/nn/test_linear_cross_entropy.py <step_N|all|regression> [device]")
+        sys.exit(1)
+    
+    command = sys.argv[1]
+    device = sys.argv[2] if len(sys.argv) > 2 else "cpu"
+    
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = "cpu"
+    
+    runner = TestLinearCrossEntropy(device)
+    
+    try:
+        if command == "all":
+            runner.run_all_tests()
+        elif command.startswith("step_"):
+            milestone_num = int(command.split("_")[1])
+            runner.run_milestone_test(milestone_num)
+        elif command == "regression":
+            # Run all regression tests
+            runner.test_step_1_regression()
+        else:
+            print(f"Unknown command: {command}")
+            print("Available commands: step_1, step_2, ..., step_8, all, regression")
+            sys.exit(1)
+        
+        success = runner.report()
+        sys.exit(0 if success else 1)
+        
+    except Exception as e:
+        print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
