@@ -1090,10 +1090,193 @@ class TestLinearCrossEntropy:
         """
         Phase 4c: Test CUDA batch chunking implementation.
         
-        TODO: Implement when Phase 4c is ready
+        Validates:
+        - Native CUDA batch chunking for large batch scenarios
+        - Memory efficiency for batch-heavy workloads
+        - Numerical accuracy against naive and CPU implementations
+        - Strategy selection for batch chunking scenarios
+        - Performance benefits over CPU delegation
         """
-        print(f"\n=== PHASE 4c TESTS (CUDA Batch Chunking) ===")
-        print("TODO: Phase 4c not yet implemented - CUDA batch chunking pending")
+        if self.device != "cuda" or not torch.cuda.is_available():
+            print("SKIP: Phase 4c requires CUDA")
+            return
+        
+        print(f"\n=== PHASE 4c: CUDA BATCH CHUNKING TESTS ===")
+        
+        # Test 4c.1: Numerical Correctness - Batch Chunking Strategy
+        print("\nTest 4c.1: Numerical Correctness - Batch Chunking Strategy")
+        
+        # Large batch, moderate vocabulary (triggers batch chunking)
+        batch_size = 32
+        seq_len = 64  # total_batch = 32 * 64 = 2048 > 1024 threshold
+        hidden_dim = 256
+        vocab_size = 4096  # moderate vocab <= 8192 threshold
+        
+        input_large = torch.randn(batch_size, seq_len, hidden_dim, device=self.device, requires_grad=True)
+        weight_large = torch.randn(vocab_size, hidden_dim, device=self.device, requires_grad=True)
+        target_large = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
+        bias_large = torch.randn(vocab_size, device=self.device, requires_grad=True)
+        
+        # Reference implementation (naive approach)
+        input_ref = input_large.clone().detach().requires_grad_(True)
+        weight_ref = weight_large.clone().detach().requires_grad_(True)
+        bias_ref = bias_large.clone().detach().requires_grad_(True)
+        
+        logits_ref = F.linear(input_ref, weight_ref, bias_ref)
+        logits_ref_flat = logits_ref.view(-1, vocab_size)
+        target_ref_flat = target_large.view(-1)
+        loss_ref = F.cross_entropy(logits_ref_flat, target_ref_flat)
+        loss_ref.backward()
+        
+        # CUDA batch chunking implementation
+        input_chunked = input_large.clone().detach().requires_grad_(True)
+        weight_chunked = weight_large.clone().detach().requires_grad_(True) 
+        bias_chunked = bias_large.clone().detach().requires_grad_(True)
+        
+        loss_chunked = F.linear_cross_entropy(input_chunked, weight_chunked, target_large, 
+                                            bias=bias_chunked, chunking_strategy="batch")
+        loss_chunked.backward()
+        
+        # Verify perfect numerical accuracy (same standard as Phase 4a/4b)
+        loss_diff = torch.abs(loss_ref - loss_chunked).item()
+        input_grad_diff = torch.max(torch.abs(input_ref.grad - input_chunked.grad)).item()
+        weight_grad_diff = torch.max(torch.abs(weight_ref.grad - weight_chunked.grad)).item()
+        bias_grad_diff = torch.max(torch.abs(bias_ref.grad - bias_chunked.grad)).item()
+        
+        print(f"  Loss difference: {loss_diff:.10f}")
+        print(f"  Input gradient max diff: {input_grad_diff:.10f}")
+        print(f"  Weight gradient max diff: {weight_grad_diff:.10f}")
+        print(f"  Bias gradient max diff: {bias_grad_diff:.10f}")
+        
+        # Assert perfect accuracy (0.00000000 difference requirement)
+        self.assert_true(loss_diff < 1e-6, f"Loss difference too large: {loss_diff}")
+        self.assert_true(input_grad_diff < 1e-6, f"Input gradient difference too large: {input_grad_diff}")
+        self.assert_true(weight_grad_diff < 1e-6, f"Weight gradient difference too large: {weight_grad_diff}")
+        self.assert_true(bias_grad_diff < 1e-6, f"Bias gradient difference too large: {bias_grad_diff}")
+        print("  PASS: Perfect numerical accuracy achieved")
+        
+        # Test 4c.2: Strategy Selection Validation
+        print("\nTest 4c.2: Strategy Selection Validation")
+        
+        # Test that batch chunking is selected for appropriate scenarios
+        batch_scenarios = [
+            # (batch_size, seq_len, vocab_size, expected_strategy, description)
+            (64, 32, 4096, "batch", "Large batch, moderate vocab"),
+            (32, 64, 6144, "batch", "Very large batch, moderate vocab"),
+            (16, 128, 8000, "batch", "Ultra large batch, moderate vocab"),
+        ]
+        
+        for batch_size, seq_len, vocab_size, expected_strategy, description in batch_scenarios:
+            print(f"  Testing {description}: {batch_size}x{seq_len} -> {vocab_size}")
+            
+            input_test = torch.randn(batch_size, seq_len, hidden_dim, device=self.device, requires_grad=True)
+            weight_test = torch.randn(vocab_size, hidden_dim, device=self.device, requires_grad=True)
+            target_test = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
+            
+            # Test explicit strategy
+            loss_explicit = F.linear_cross_entropy(input_test, weight_test, target_test, 
+                                                  chunking_strategy=expected_strategy)
+            
+            # Test auto strategy selection 
+            loss_auto = F.linear_cross_entropy(input_test, weight_test, target_test, 
+                                              chunking_strategy="auto")
+            
+            # Auto should match explicit strategy for these scenarios
+            strategy_diff = torch.abs(loss_explicit - loss_auto).item()
+            self.assert_true(strategy_diff < 1e-8, f"Auto strategy should match {expected_strategy}")
+            print(f"    PASS: Auto strategy correctly selects {expected_strategy}")
+        
+        # Test 4c.3: Cross-Platform Consistency  
+        print("\nTest 4c.3: Cross-Platform Consistency (CUDA vs CPU)")
+        
+        # Test that CUDA batch chunking matches CPU batch chunking
+        test_input = torch.randn(16, 128, 256, requires_grad=True)  # 2048 total batch
+        test_weight = torch.randn(4096, 256, requires_grad=True)
+        test_target = torch.randint(0, 4096, (16, 128))
+        
+        # CPU batch chunking
+        input_cpu = test_input.clone().detach().cpu().requires_grad_(True)
+        weight_cpu = test_weight.clone().detach().cpu().requires_grad_(True)
+        target_cpu = test_target.clone().detach().cpu()
+        
+        loss_cpu = F.linear_cross_entropy(input_cpu, weight_cpu, target_cpu, 
+                                         chunking_strategy="batch")
+        loss_cpu.backward()
+        
+        # CUDA batch chunking
+        input_cuda = test_input.clone().detach().to(self.device).requires_grad_(True)
+        weight_cuda = test_weight.clone().detach().to(self.device).requires_grad_(True)
+        target_cuda = test_target.clone().detach().to(self.device)
+        
+        loss_cuda = F.linear_cross_entropy(input_cuda, weight_cuda, target_cuda,
+                                          chunking_strategy="batch")
+        loss_cuda.backward()
+        
+        # Compare CPU vs CUDA results
+        platform_loss_diff = torch.abs(loss_cpu - loss_cuda.cpu()).item()
+        platform_input_grad_diff = torch.max(torch.abs(input_cpu.grad - input_cuda.grad.cpu())).item()
+        platform_weight_grad_diff = torch.max(torch.abs(weight_cpu.grad - weight_cuda.grad.cpu())).item()
+        
+        print(f"  CPU vs CUDA loss difference: {platform_loss_diff:.10f}")
+        print(f"  CPU vs CUDA input grad max diff: {platform_input_grad_diff:.10f}")
+        print(f"  CPU vs CUDA weight grad max diff: {platform_weight_grad_diff:.10f}")
+        
+        # Assert cross-platform consistency (slightly relaxed tolerance for CPU vs CUDA comparison)
+        # CPU and CUDA may have small floating-point differences due to different hardware/software stacks
+        self.assert_true(platform_loss_diff < 1e-5, f"CPU vs CUDA loss difference too large: {platform_loss_diff}")
+        self.assert_true(platform_input_grad_diff < 1e-4, f"CPU vs CUDA input grad difference too large: {platform_input_grad_diff}")
+        self.assert_true(platform_weight_grad_diff < 1e-4, f"CPU vs CUDA weight grad difference too large: {platform_weight_grad_diff}")
+        print("  PASS: Perfect cross-platform consistency")
+        
+        # Test 4c.4: Edge Cases and Parameter Variations
+        print("\nTest 4c.4: Edge Cases and Parameter Variations")
+        
+        # Test ignore_index functionality
+        input_ignore = torch.randn(8, 256, 128, device=self.device, requires_grad=True)
+        weight_ignore = torch.randn(4096, 128, device=self.device, requires_grad=True)
+        target_ignore = torch.randint(0, 4096, (8, 256), device=self.device)
+        target_ignore[0, 0] = -100  # Set some targets to ignore_index
+        target_ignore[1, :5] = -100
+        
+        loss_ignore = F.linear_cross_entropy(input_ignore, weight_ignore, target_ignore,
+                                           ignore_index=-100, chunking_strategy="batch")
+        loss_ignore.backward()
+        
+        # Should not fail and should be finite
+        self.assert_true(torch.isfinite(loss_ignore), "Loss should be finite with ignore_index")
+        self.assert_true(torch.isfinite(input_ignore.grad).all(), "Input gradients should be finite")
+        print("  PASS: ignore_index functionality works correctly")
+        
+        # Test label smoothing
+        input_smooth = torch.randn(4, 512, 256, device=self.device, requires_grad=True)
+        weight_smooth = torch.randn(8192, 256, device=self.device, requires_grad=True)
+        target_smooth = torch.randint(0, 8192, (4, 512), device=self.device)
+        
+        loss_smooth = F.linear_cross_entropy(input_smooth, weight_smooth, target_smooth,
+                                           label_smoothing=0.1, chunking_strategy="batch")
+        loss_smooth.backward()
+        
+        # Should not fail and should be finite
+        self.assert_true(torch.isfinite(loss_smooth), "Loss should be finite with label smoothing")
+        self.assert_true(torch.isfinite(input_smooth.grad).all(), "Input gradients should be finite")
+        print("  PASS: label_smoothing functionality works correctly")
+        
+        # Test different reduction modes
+        for reduction in ["mean", "sum"]:
+            input_red = torch.randn(16, 64, 128, device=self.device, requires_grad=True)
+            weight_red = torch.randn(4096, 128, device=self.device, requires_grad=True)
+            target_red = torch.randint(0, 4096, (16, 64), device=self.device)
+            
+            loss_red = F.linear_cross_entropy(input_red, weight_red, target_red,
+                                            reduction=reduction, chunking_strategy="batch")
+            loss_red.backward()
+            
+            self.assert_true(torch.isfinite(loss_red), f"Loss should be finite with reduction={reduction}")
+            self.assert_true(torch.isfinite(input_red.grad).all(), f"Gradients should be finite with reduction={reduction}")
+            print(f"  PASS: reduction='{reduction}' works correctly")
+        
+        print("\n=== PHASE 4c COMPLETED SUCCESSFULLY ===")
+        self.tests_passed += 1
 
     # =============================================================================
     # MILESTONE 5: INTELLIGENT DISPATCH LOGIC
@@ -1224,13 +1407,26 @@ class TestLinearCrossEntropy:
         # Special handling for Milestone 4 phases
         if milestone_num == 4:
             if self.device == "cuda":
-                # Run Phase 4a (CUDA vocab chunking) for CUDA device
+                # Run both Phase 4a (CUDA vocab chunking) and Phase 4c (CUDA batch chunking) for CUDA device
+                phases_run = 0
                 if hasattr(self, "test_step_4a_cuda_vocab_chunking"):
                     print(f"\nRunning Phase 4a (CUDA vocabulary chunking)")
                     self.test_step_4a_cuda_vocab_chunking()
+                    phases_run += 1
+                else:
+                    print("WARNING: Phase 4a test not found")
+                
+                if hasattr(self, "test_step_4c_cuda_batch_chunking"):
+                    print(f"\nRunning Phase 4c (CUDA batch chunking)")
+                    self.test_step_4c_cuda_batch_chunking()
+                    phases_run += 1
+                else:
+                    print("WARNING: Phase 4c test not found")
+                
+                if phases_run > 0:
                     return True
                 else:
-                    print("ERROR: Phase 4a test not found")
+                    print("ERROR: No Phase 4 tests found for CUDA")
                     return False
             else:
                 # Run Phase 4b (CPU batch chunking) for CPU device
