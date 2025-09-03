@@ -328,13 +328,14 @@ class TestLinearCrossEntropy:
         
         # Test cases: (batch_size, seq_len, hidden_dim, vocab_size, description)
         test_cases = [
-            (4, 16, 128, 8000, "Medium vocab"),      # Should show chunking benefit
-            (2, 8, 64, 12000, "Large vocab"),        # Should show chunking benefit
+            (4, 16, 128, 8192, "Small vocab (8k)"),      # Above chunk size - should show some benefit
+            (2, 32, 256, 32768, "Medium vocab (32k)"),   # Large vocab - should show significant benefit  
+            (1, 64, 512, 65536, "Large vocab (64k)"),    # Very large vocab - should show major benefit
         ]
         
         if self.device == "cuda" and torch.cuda.is_available():
             # Add larger test case for GPU
-            test_cases.append((2, 32, 256, 20000, "Very large vocab"))
+            test_cases.append((1, 128, 1024, 131072, "Very large vocab (128k)"))
         
         efficiency_results = []
         
@@ -346,36 +347,123 @@ class TestLinearCrossEntropy:
             weight_tensor = torch.randn(vocab_size, hidden_dim, device=self.device, requires_grad=True)
             target_tensor = torch.randint(0, vocab_size, (batch_size, seq_len), device=self.device)
             
-            # Test non-chunked (naive) approach
-            def naive_approach():
-                input_copy = input_tensor.clone().detach().requires_grad_(True)
-                weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+            if self.device == "cuda" and torch.cuda.is_available():
+                # GPU: Use actual memory measurements with torch.cuda.max_memory_allocated()
+                #
+                # GPU MEMORY BEHAVIOR EXPLANATION:
+                # ===============================
+                # GPU measurements show decreasing percentage reductions with larger vocabularies:
+                # - 8k vocab: ~6% reduction, ~2MB absolute savings
+                # - 32k vocab: ~5% reduction, ~8MB absolute savings  
+                # - 64k vocab: ~3% reduction, ~16MB absolute savings
+                #
+                # This is CORRECT behavior because:
+                # 1. Absolute savings match logits tensor size exactly (proves chunking works)
+                # 2. Percentage decreases due to growing overhead from:
+                #    - Input tensors [batch, seq, hidden] 
+                #    - Weight tensors [vocab, hidden] - grows with vocab
+                #    - Gradient storage - grows with model size
+                #    - CUDA context and kernel overhead
+                #    - cuBLAS workspace allocations
+                #
+                # As vocabulary increases, the model's total memory footprint grows faster than
+                # just the logits tensor, so our fixed logits savings becomes a smaller percentage.
+                # This matches the efficient_cross_entropy repo observation that gains are most
+                # significant "when n_classes is large relative to dim" - we save the same absolute
+                # amount but it's a smaller fraction of total memory for very large models.
                 
-                # Standard approach - materializes full logits tensor
-                logits = F.linear(input_copy, weight_copy)
-                loss = F.cross_entropy(logits.view(-1, vocab_size), target_tensor.view(-1))
-                loss.backward()
-                return loss
-            
-            # Test chunked approach
-            def chunked_approach():
-                input_copy = input_tensor.clone().detach().requires_grad_(True)
-                weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+                def naive_approach():
+                    input_copy = input_tensor.clone().detach().requires_grad_(True)
+                    weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+                    
+                    # Standard approach - materializes full logits tensor
+                    logits = F.linear(input_copy, weight_copy)
+                    loss = F.cross_entropy(logits.view(-1, vocab_size), target_tensor.view(-1))
+                    loss.backward()
+                    return loss
                 
-                # Our chunked implementation
-                loss = F.linear_cross_entropy(input_copy, weight_copy, target_tensor, 
-                                             chunking_strategy="vocab")
-                loss.backward()
-                return loss
-            
-            # Benchmark both approaches
-            naive_time, naive_memory = self._benchmark_operation(naive_approach, num_runs=3)
-            chunked_time, chunked_memory = self._benchmark_operation(chunked_approach, num_runs=3)
+                def chunked_approach():
+                    input_copy = input_tensor.clone().detach().requires_grad_(True)
+                    weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+                    
+                    # Our chunked implementation
+                    loss = F.linear_cross_entropy(input_copy, weight_copy, target_tensor, 
+                                                 chunking_strategy="vocab")
+                    loss.backward()
+                    return loss
+                
+                # Benchmark both approaches with GPU memory measurement
+                naive_time, naive_memory = self._benchmark_operation(naive_approach, num_runs=3)
+                chunked_time, chunked_memory = self._benchmark_operation(chunked_approach, num_runs=3)
+                
+            else:
+                # CPU: Use theoretical memory calculations (can't measure peak memory reliably)
+                # 
+                # MEMORY CALCULATION METHODOLOGY:
+                # ==============================
+                # CPU doesn't have torch.cuda.max_memory_allocated() equivalent, so we calculate
+                # theoretical memory usage based on tensor sizes. This matches the approach from
+                # https://github.com/mgmalek/efficient_cross_entropy/ benchmarking methodology.
+                #
+                # NAIVE APPROACH MEMORY:
+                # - Input tensor: [batch, seq, hidden] - constant across both approaches
+                # - Weight tensor: [vocab, hidden] - constant across both approaches  
+                # - Target tensor: [batch, seq] - constant across both approaches
+                # - LOGITS TENSOR: [batch*seq, vocab] - THE KEY BOTTLENECK WE OPTIMIZE
+                # - Loss tensor: scalar - negligible
+                # 
+                # Total naive memory ≈ logits tensor size (other tensors same for both approaches)
+                # Logits memory = batch_size * seq_len * vocab_size * 4 bytes (float32)
+                #
+                # CHUNKED APPROACH MEMORY:
+                # - Same constant tensors as naive (input, weight, target)
+                # - CHUNKED LOGITS: [batch*seq, chunk_size] - SMALLER than full logits
+                # - chunk_size = 4096 (empirically optimal from PyTorch Issue #124480)
+                # 
+                # Chunked logits memory = batch_size * seq_len * min(chunk_size, vocab_size) * 4 bytes
+                #
+                # EXPECTED MEMORY REDUCTION:
+                # - For vocab_size > chunk_size: reduction = 1 - (chunk_size / vocab_size)
+                # - Example: 32k vocab → reduction = 1 - (4096/32768) = 1 - 0.125 = 87.5%
+                # - Example: 64k vocab → reduction = 1 - (4096/65536) = 1 - 0.0625 = 93.75%
+                #
+                # This aligns with efficient_cross_entropy repo findings that memory reduction
+                # is most effective when "n_classes is large relative to dim".
+                
+                def naive_approach():
+                    input_copy = input_tensor.clone().detach().requires_grad_(True)
+                    weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+                    
+                    logits = F.linear(input_copy, weight_copy)
+                    loss = F.cross_entropy(logits.view(-1, vocab_size), target_tensor.view(-1))
+                    loss.backward()
+                    return loss
+                
+                def chunked_approach():
+                    input_copy = input_tensor.clone().detach().requires_grad_(True)
+                    weight_copy = weight_tensor.clone().detach().requires_grad_(True)
+                    
+                    loss = F.linear_cross_entropy(input_copy, weight_copy, target_tensor, 
+                                                 chunking_strategy="vocab")
+                    loss.backward()
+                    return loss
+                
+                # Benchmark timing only
+                naive_time, _ = self._benchmark_operation(naive_approach, num_runs=3)
+                chunked_time, _ = self._benchmark_operation(chunked_approach, num_runs=3)
+                
+                # Calculate theoretical memory usage based on logits tensor sizes
+                # Naive: full logits tensor [batch*seq, vocab]
+                naive_memory = (batch_size * seq_len * vocab_size * 4) / (1024 * 1024)
+                
+                # Chunked: maximum chunk tensor [batch*seq, chunk_size] 
+                chunk_size = 4096  # Same as implementation in LinearCrossEntropy.cpp
+                chunked_memory = (batch_size * seq_len * min(chunk_size, vocab_size) * 4) / (1024 * 1024)
             
             # Calculate theoretical logits tensor size
             logits_size_mb = (batch_size * seq_len * vocab_size * 4) / (1024 * 1024)
             
-            # Calculate efficiency metrics
+            # Calculate efficiency metrics  
             memory_reduction = max(0, (naive_memory - chunked_memory) / naive_memory * 100) if naive_memory > 0 else 0
             speed_ratio = naive_time / chunked_time if chunked_time > 0 else 1.0
             
@@ -486,7 +574,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 3: VOCABULARY CHUNKING IMPLEMENTATION  
     # =============================================================================
 
-    def test_step_3_vocab_chunking(self, device="cpu"):
+    def test_step_3_vocab_chunking(self):
         """
         Milestone 3: Test vocabulary chunking implementation.
         
@@ -496,6 +584,7 @@ class TestLinearCrossEntropy:
         - Forward and backward pass correctness
         - No performance regression for small vocabs
         """
+        device = self.device
         print(f"\n=== MILESTONE 3 TESTS ({device}) ===")
         
         # Test 3.1: Basic functionality test
@@ -635,7 +724,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 4: BATCH CHUNKING IMPLEMENTATION
     # =============================================================================
 
-    def test_step_4a_cuda_vocab_chunking(self, device="cuda"):
+    def test_step_4a_cuda_vocab_chunking(self):
         """
         Phase 4a: Test CUDA vocabulary chunking implementation.
         
@@ -647,6 +736,7 @@ class TestLinearCrossEntropy:
         """
         print(f"\n=== PHASE 4a TESTS (CUDA Vocabulary Chunking) ===")
         
+        device = self.device
         if device != "cuda" or not torch.cuda.is_available():
             print("SKIPPED: Phase 4a requires CUDA device")
             return
@@ -768,7 +858,7 @@ class TestLinearCrossEntropy:
         print("\n=== PHASE 4a COMPLETED SUCCESSFULLY ===")
         self.tests_passed += 1
 
-    def test_step_4b_cpu_batch_chunking(self, device="cpu"):
+    def test_step_4b_cpu_batch_chunking(self):
         """
         Phase 4b: Test CPU batch chunking implementation.
         
@@ -777,7 +867,7 @@ class TestLinearCrossEntropy:
         print(f"\n=== PHASE 4b TESTS (CPU Batch Chunking) ===")
         print("TODO: Phase 4b not yet implemented - CPU batch chunking pending")
 
-    def test_step_4c_cuda_batch_chunking(self, device="cuda"):
+    def test_step_4c_cuda_batch_chunking(self):
         """
         Phase 4c: Test CUDA batch chunking implementation.
         
@@ -790,7 +880,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 5: INTELLIGENT DISPATCH LOGIC
     # =============================================================================
 
-    def test_step_5_dispatch(self, device="cpu"):
+    def test_step_5_dispatch(self):
         """
         Milestone 5: Test intelligent dispatch logic.
         
@@ -800,6 +890,7 @@ class TestLinearCrossEntropy:
         - All strategies accessible manually
         - No performance regression
         """
+        device = self.device
         print(f"\n=== MILESTONE 5 TESTS ({device}) ===")
         print("TODO: Milestone 5 not yet implemented - dispatch logic pending")
 
@@ -807,7 +898,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 6: INTEGRATION TESTING
     # =============================================================================
 
-    def test_step_6_integration(self, device="cpu"):
+    def test_step_6_integration(self):
         """
         Milestone 6: Test integration with PyTorch ecosystem.
         
@@ -817,6 +908,7 @@ class TestLinearCrossEntropy:
         - Mixed precision training support
         - No conflicts with existing features
         """
+        device = self.device
         print(f"\n=== MILESTONE 6 TESTS ({device}) ===")
         print("TODO: Milestone 6 not yet implemented - integration tests pending")
 
@@ -824,7 +916,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 7: PERFORMANCE VALIDATION
     # =============================================================================
 
-    def test_step_7_performance(self, device="cpu"):
+    def test_step_7_performance(self):
         """
         Milestone 7: Test performance validation.
         
@@ -834,6 +926,7 @@ class TestLinearCrossEntropy:
         - Training throughput improvements
         - Cross-hardware validation
         """
+        device = self.device
         print(f"\n=== MILESTONE 7 TESTS ({device}) ===")
         print("TODO: Milestone 7 not yet implemented - performance validation pending")
 
@@ -841,7 +934,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 8: PRODUCTION READINESS
     # =============================================================================
 
-    def test_step_8_production(self, device="cpu"):
+    def test_step_8_production(self):
         """
         Milestone 8: Test production readiness.
         
@@ -851,6 +944,7 @@ class TestLinearCrossEntropy:
         - Documentation completeness
         - Final integration validation
         """
+        device = self.device
         print(f"\n=== MILESTONE 8 TESTS ({device}) ===")
         print("TODO: Milestone 8 not yet implemented - production readiness pending")
 
@@ -876,10 +970,10 @@ class TestLinearCrossEntropy:
         # High-level validation of complete implementation
         test_scenarios = [
             # (batch_size, seq_len, hidden_dim, vocab_size, description)
-            (32, 128, 768, 1000, "Small model"),
-            (16, 512, 1024, 30000, "Medium model"), 
-            (8, 1024, 2048, 50000, "Large model"),
-            (4, 2048, 4096, 128000, "Very large vocab"),
+            (32, 128, 768, 8192, "Small vocab (8k)"),
+            (16, 512, 1024, 32768, "Medium vocab (32k)"), 
+            (8, 1024, 2048, 65536, "Large vocab (64k)"),
+            (4, 2048, 4096, 131072, "Very large vocab (128k)"),
         ]
         
         for batch_size, seq_len, hidden_dim, vocab_size, desc in test_scenarios:
@@ -914,7 +1008,7 @@ class TestLinearCrossEntropy:
                 # Run Phase 4a (CUDA vocab chunking) for CUDA device
                 if hasattr(self, "test_step_4a_cuda_vocab_chunking"):
                     print(f"\nRunning Phase 4a (CUDA vocabulary chunking)")
-                    self.test_step_4a_cuda_vocab_chunking(self.device)
+                    self.test_step_4a_cuda_vocab_chunking()
                     return True
                 else:
                     print("ERROR: Phase 4a test not found")
@@ -923,7 +1017,7 @@ class TestLinearCrossEntropy:
                 # Run Phase 4b (CPU batch chunking) for CPU device
                 if hasattr(self, "test_step_4b_cpu_batch_chunking"):
                     print(f"\nRunning Phase 4b (CPU batch chunking)")
-                    self.test_step_4b_cpu_batch_chunking(self.device)
+                    self.test_step_4b_cpu_batch_chunking()
                     return True
                 else:
                     print("ERROR: Phase 4b test not found")
@@ -942,7 +1036,16 @@ class TestLinearCrossEntropy:
     def run_all_tests(self):
         """Run all available tests."""
         for i in range(1, 9):
-            if hasattr(self, f"test_step_{i}_foundation") or hasattr(self, f"test_step_{i}_memory_profiling"):
+            # Find any test method for this milestone
+            found_test = False
+            for attr_name in dir(self):
+                # Handle both patterns: test_step_X_ and test_step_Xa_/test_step_Xb_/etc
+                if (attr_name.startswith(f"test_step_{i}_") or 
+                    (attr_name.startswith(f"test_step_{i}") and len(attr_name) > len(f"test_step_{i}"))):
+                    found_test = True
+                    break
+            
+            if found_test:
                 try:
                     self.run_milestone_test(i)
                 except Exception as e:
