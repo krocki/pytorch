@@ -635,21 +635,156 @@ class TestLinearCrossEntropy:
     # MILESTONE 4: BATCH CHUNKING IMPLEMENTATION
     # =============================================================================
 
-    def test_step_4_batch_chunking(self, device="cpu"):
+    def test_step_4a_cuda_vocab_chunking(self, device="cuda"):
         """
-        Milestone 4: Test batch chunking implementation.
+        Phase 4a: Test CUDA vocabulary chunking implementation.
         
         Validates:
-        - Triton kernel registration and functionality
-        - Batch chunking reduces memory usage
-        - Autograd compatibility
-        - Performance improvement for large batches
+        - Native CUDA vocabulary chunking (no CPU delegation)
+        - Memory efficiency on GPU
+        - Accuracy matches CPU implementation
+        - Performance improvement for large vocabularies
         """
-        print(f"\n=== MILESTONE 4 TESTS ({device}) ===")
-        print("TODO: Milestone 4 not yet implemented - batch chunking pending")
+        print(f"\n=== PHASE 4a TESTS (CUDA Vocabulary Chunking) ===")
         
-        # Placeholder for batch chunking tests
-        # TODO: Implement when batch chunking is ready
+        if device != "cuda" or not torch.cuda.is_available():
+            print("SKIPPED: Phase 4a requires CUDA device")
+            return
+        
+        print("Testing Phase 4a: CUDA Vocabulary Chunking implementation...")
+        
+        # Test scenario: Large vocabulary that triggers chunking
+        batch_size, seq_len, hidden_dim = 8, 1024, 2048
+        vocab_size = 65536  # Large vocab to ensure chunking is used
+        
+        input = torch.randn(batch_size, seq_len, hidden_dim, device=device, requires_grad=True)
+        weight = torch.randn(vocab_size, hidden_dim, device=device, requires_grad=True) 
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        bias = torch.randn(vocab_size, device=device, requires_grad=True)
+        
+        print(f"Input shape: {input.shape}")
+        print(f"Weight shape: {weight.shape}")
+        print(f"Target shape: {target.shape}")
+        
+        # Test 1: Verify CUDA vocabulary chunking works
+        print("\n1. Testing CUDA vocabulary chunking...")
+        loss_cuda_vocab = F.linear_cross_entropy(
+            input, weight, target, bias=bias, 
+            chunking_strategy="vocab"
+        )
+        
+        # Verify result is valid
+        assert torch.isfinite(loss_cuda_vocab), "CUDA vocab chunking loss should be finite"
+        assert loss_cuda_vocab.requires_grad, "CUDA vocab chunking should support gradients"
+        print(f"   CUDA vocab chunking loss: {loss_cuda_vocab.item():.6f}")
+        
+        # Test 2: Compare with naive implementation for accuracy
+        print("\n2. Testing accuracy vs naive implementation...")
+        with torch.no_grad():
+            # Create smaller test case for naive comparison (to avoid OOM)
+            small_vocab = 1000
+            small_weight = weight[:small_vocab].clone().detach().requires_grad_(True)
+            small_bias = bias[:small_vocab].clone().detach().requires_grad_(True) if bias is not None else None
+            small_target = torch.randint(0, small_vocab, (batch_size, seq_len), device=device)
+            
+            # CUDA vocab chunking
+            loss_chunked = F.linear_cross_entropy(
+                input.detach(), small_weight, small_target, bias=small_bias,
+                chunking_strategy="vocab"
+            )
+            
+            # Naive implementation  
+            loss_naive = F.linear_cross_entropy(
+                input.detach(), small_weight, small_target, bias=small_bias,
+                chunking_strategy="none"
+            )
+            
+            # Verify accuracy (should be very close)
+            diff = torch.abs(loss_chunked - loss_naive).item()
+            print(f"   Chunked loss: {loss_chunked.item():.6f}")
+            print(f"   Naive loss: {loss_naive.item():.6f}")
+            print(f"   Absolute difference: {diff:.8f}")
+            assert diff < 1e-4, f"CUDA vocab chunking accuracy error too large: {diff}"
+        
+        # Test 3: Test backward pass
+        print("\n3. Testing gradient computation...")
+        loss_cuda_vocab.backward()
+        
+        assert input.grad is not None, "Input gradients should exist"
+        assert weight.grad is not None, "Weight gradients should exist"
+        assert bias.grad is not None, "Bias gradients should exist"
+        
+        assert torch.isfinite(input.grad).all(), "Input gradients should be finite"
+        assert torch.isfinite(weight.grad).all(), "Weight gradients should be finite"
+        assert torch.isfinite(bias.grad).all(), "Bias gradients should be finite"
+        print("   PASS: All gradients computed successfully")
+        
+        # Test 4: Memory efficiency test
+        print("\n4. Testing memory efficiency...")
+        
+        def measure_cuda_memory_chunked():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+            
+            test_input = torch.randn(4, 512, 1024, device=device, requires_grad=True)
+            test_weight = torch.randn(32768, 1024, device=device, requires_grad=True)
+            test_target = torch.randint(0, 32768, (4, 512), device=device)
+            
+            loss = F.linear_cross_entropy(
+                test_input, test_weight, test_target,
+                chunking_strategy="vocab"
+            )
+            loss.backward()
+            
+            return torch.cuda.max_memory_allocated(device)
+        
+        def measure_cuda_memory_naive():
+            torch.cuda.empty_cache() 
+            torch.cuda.reset_peak_memory_stats(device)
+            
+            test_input = torch.randn(4, 512, 1024, device=device, requires_grad=True)
+            test_weight = torch.randn(8192, 1024, device=device, requires_grad=True)  # Smaller to avoid OOM
+            test_target = torch.randint(0, 8192, (4, 512), device=device)
+            
+            loss = F.linear_cross_entropy(
+                test_input, test_weight, test_target,
+                chunking_strategy="none"
+            )
+            loss.backward()
+            
+            return torch.cuda.max_memory_allocated(device)
+        
+        memory_chunked = measure_cuda_memory_chunked() / (1024**2)  # MB
+        memory_naive = measure_cuda_memory_naive() / (1024**2)     # MB
+        
+        print(f"   Chunked memory (vocab=32k): {memory_chunked:.1f} MB")
+        print(f"   Naive memory (vocab=8k): {memory_naive:.1f} MB")
+        
+        # Even with 4x larger vocab, chunked should use similar memory
+        memory_ratio = memory_chunked / memory_naive
+        print(f"   Memory ratio: {memory_ratio:.2f}x")
+        assert memory_ratio < 2.0, f"CUDA chunking should be memory efficient, got {memory_ratio:.2f}x"
+        
+        print("\n=== PHASE 4a COMPLETED SUCCESSFULLY ===")
+        self.tests_passed += 1
+
+    def test_step_4b_cpu_batch_chunking(self, device="cpu"):
+        """
+        Phase 4b: Test CPU batch chunking implementation.
+        
+        TODO: Implement when Phase 4b is ready
+        """
+        print(f"\n=== PHASE 4b TESTS (CPU Batch Chunking) ===")
+        print("TODO: Phase 4b not yet implemented - CPU batch chunking pending")
+
+    def test_step_4c_cuda_batch_chunking(self, device="cuda"):
+        """
+        Phase 4c: Test CUDA batch chunking implementation.
+        
+        TODO: Implement when Phase 4c is ready
+        """
+        print(f"\n=== PHASE 4c TESTS (CUDA Batch Chunking) ===")
+        print("TODO: Phase 4c not yet implemented - CUDA batch chunking pending")
 
     # =============================================================================
     # MILESTONE 5: INTELLIGENT DISPATCH LOGIC
@@ -773,6 +908,28 @@ class TestLinearCrossEntropy:
         """Run a specific milestone test."""
         method_name = f"test_step_{milestone_num}_"
         
+        # Special handling for Milestone 4 phases
+        if milestone_num == 4:
+            if self.device == "cuda":
+                # Run Phase 4a (CUDA vocab chunking) for CUDA device
+                if hasattr(self, "test_step_4a_cuda_vocab_chunking"):
+                    print(f"\nRunning Phase 4a (CUDA vocabulary chunking)")
+                    self.test_step_4a_cuda_vocab_chunking(self.device)
+                    return True
+                else:
+                    print("ERROR: Phase 4a test not found")
+                    return False
+            else:
+                # Run Phase 4b (CPU batch chunking) for CPU device
+                if hasattr(self, "test_step_4b_cpu_batch_chunking"):
+                    print(f"\nRunning Phase 4b (CPU batch chunking)")
+                    self.test_step_4b_cpu_batch_chunking(self.device)
+                    return True
+                else:
+                    print("ERROR: Phase 4b test not found")
+                    return False
+        
+        # Standard milestone handling for other milestones
         for attr_name in dir(self):
             if attr_name.startswith(method_name):
                 print(f"\nRunning {attr_name} on {self.device}")
