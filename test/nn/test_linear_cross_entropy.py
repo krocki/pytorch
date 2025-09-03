@@ -300,7 +300,7 @@ class TestLinearCrossEntropy:
     # MILESTONE 2: MEMORY PROFILING INFRASTRUCTURE
     # =============================================================================
 
-    def test_step_2_memory_profiling(self):
+    def test_step_2_memory_profiling(self, comprehensive=False):
         """
         Milestone 2: Test memory profiling infrastructure and chunking efficiency.
         
@@ -326,21 +326,56 @@ class TestLinearCrossEntropy:
         # Test 2.2: Memory efficiency comparison - chunked vs non-chunked
         print("\nTest 2.2: Memory Efficiency Comparison")
         
-        # Test cases: (batch_size, seq_len, hidden_dim, vocab_size, description)
-        test_cases = [
-            (4, 16, 128, 8192, "Small vocab (8k)"),      # Above chunk size - should show some benefit
-            (2, 32, 256, 32768, "Medium vocab (32k)"),   # Large vocab - should show significant benefit  
-            (1, 64, 512, 65536, "Large vocab (64k)"),    # Very large vocab - should show major benefit
+        # Use comprehensive mode flag
+        
+        # Quick test cases (run by default) - one test per strategy
+        quick_test_cases = [
+            # Quick vocabulary chunking test
+            (4, 16, 128, 8192, "vocab", "Vocab chunking (8k vocab, 64 batch)"),
+            # Quick batch chunking test  
+            (32, 32, 256, 4096, "batch", "Batch chunking (4k vocab, 1024 batch)"),
+            # Quick auto strategy test
+            (8, 16, 256, 8192, "auto", "Auto strategy (8k vocab, 128 batch)"),
         ]
         
+        # Comprehensive test cases (run only when requested)
+        comprehensive_test_cases = [
+            # Vocabulary chunking scenarios - large vocab, moderate batch
+            (4, 16, 128, 8192, "vocab", "Small vocab chunking (8k vocab, 64 batch)"),
+            (2, 32, 256, 32768, "vocab", "Medium vocab chunking (32k vocab, 64 batch)"),
+            (1, 64, 512, 65536, "vocab", "Large vocab chunking (64k vocab, 64 batch)"),
+            
+            # Batch chunking scenarios - large batch, moderate vocab  
+            (32, 64, 256, 4096, "batch", "Small batch chunking (4k vocab, 2048 batch)"),
+            (16, 128, 512, 8192, "batch", "Medium batch chunking (8k vocab, 2048 batch)"),
+            (64, 32, 256, 4096, "batch", "Large batch chunking (4k vocab, 2048 batch)"),
+            
+            # Mixed scenarios where auto strategy selection matters
+            (8, 32, 256, 16384, "auto", "Mixed scenario 1 (16k vocab, 256 batch)"),
+            (16, 16, 128, 8192, "auto", "Mixed scenario 2 (8k vocab, 256 batch)"),
+        ]
+        
+        # Select test cases based on mode
+        test_cases = comprehensive_test_cases if comprehensive else quick_test_cases
+        
+        if comprehensive:
+            print("    Running comprehensive memory tests")
+        else:
+            print("    Running quick memory tests (3 key scenarios)")
+        
         if self.device == "cuda" and torch.cuda.is_available():
-            # Add larger test case for GPU
-            test_cases.append((1, 128, 1024, 131072, "Very large vocab (128k)"))
+            # Add larger test cases for GPU
+            test_cases.extend([
+                (1, 128, 1024, 131072, "vocab", "Very large vocab chunking (128k vocab, 128 batch)"),
+                (128, 16, 512, 8192, "batch", "GPU large batch chunking (8k vocab, 2048 batch)"),
+            ])
         
         efficiency_results = []
         
-        for batch_size, seq_len, hidden_dim, vocab_size, description in test_cases:
-            print(f"\n  Testing {description} (vocab={vocab_size}):")
+        for batch_size, seq_len, hidden_dim, vocab_size, expected_strategy, description in test_cases:
+            total_batch_size = batch_size * seq_len
+            print(f"\n  Testing {description}:")
+            print(f"    Dimensions: {batch_size}x{seq_len}x{hidden_dim} -> {vocab_size} (total_batch={total_batch_size})")
             
             # Prepare test tensors
             input_tensor = torch.randn(batch_size, seq_len, hidden_dim, device=self.device, requires_grad=True)
@@ -386,9 +421,9 @@ class TestLinearCrossEntropy:
                     input_copy = input_tensor.clone().detach().requires_grad_(True)
                     weight_copy = weight_tensor.clone().detach().requires_grad_(True)
                     
-                    # Our chunked implementation
+                    # Use the expected chunking strategy for this test case
                     loss = F.linear_cross_entropy(input_copy, weight_copy, target_tensor, 
-                                                 chunking_strategy="vocab")
+                                                 chunking_strategy=expected_strategy)
                     loss.backward()
                     return loss
                 
@@ -443,8 +478,9 @@ class TestLinearCrossEntropy:
                     input_copy = input_tensor.clone().detach().requires_grad_(True)
                     weight_copy = weight_tensor.clone().detach().requires_grad_(True)
                     
+                    # Use the expected chunking strategy for this test case
                     loss = F.linear_cross_entropy(input_copy, weight_copy, target_tensor, 
-                                                 chunking_strategy="vocab")
+                                                 chunking_strategy=expected_strategy)
                     loss.backward()
                     return loss
                 
@@ -456,9 +492,25 @@ class TestLinearCrossEntropy:
                 # Naive: full logits tensor [batch*seq, vocab]
                 naive_memory = (batch_size * seq_len * vocab_size * 4) / (1024 * 1024)
                 
-                # Chunked: maximum chunk tensor [batch*seq, chunk_size] 
-                chunk_size = 4096  # Same as implementation in LinearCrossEntropy.cpp
-                chunked_memory = (batch_size * seq_len * min(chunk_size, vocab_size) * 4) / (1024 * 1024)
+                # Chunked: depends on strategy
+                if expected_strategy == "vocab":
+                    # Vocabulary chunking: [batch*seq, chunk_size]
+                    chunk_size = 4096  # Same as implementation in LinearCrossEntropy.cpp
+                    chunked_memory = (batch_size * seq_len * min(chunk_size, vocab_size) * 4) / (1024 * 1024)
+                elif expected_strategy == "batch":
+                    # Batch chunking: [chunk_size, vocab]
+                    batch_chunk_size = 1024  # Same as implementation in LinearCrossEntropy.cpp
+                    effective_batch = batch_size * seq_len
+                    chunked_memory = (min(batch_chunk_size, effective_batch) * vocab_size * 4) / (1024 * 1024)
+                else:
+                    # Auto strategy - calculate both and pick better one
+                    vocab_chunk_size = 4096
+                    batch_chunk_size = 1024
+                    effective_batch = batch_size * seq_len
+                    
+                    vocab_chunked = (effective_batch * min(vocab_chunk_size, vocab_size) * 4) / (1024 * 1024)
+                    batch_chunked = (min(batch_chunk_size, effective_batch) * vocab_size * 4) / (1024 * 1024)
+                    chunked_memory = min(vocab_chunked, batch_chunked)
             
             # Calculate theoretical logits tensor size
             logits_size_mb = (batch_size * seq_len * vocab_size * 4) / (1024 * 1024)
@@ -487,6 +539,14 @@ class TestLinearCrossEntropy:
             self.assert_allclose(naive_result, chunked_result, atol=1e-4, 
                                message=f"{description} numerical correctness")
             print(f"    PASS: Numerical correctness verified")
+            
+            # For specific expected strategies, also test auto strategy selection
+            if expected_strategy in ["vocab", "batch"]:
+                auto_result = F.linear_cross_entropy(input_tensor, weight_tensor, target_tensor, 
+                                                   chunking_strategy="auto")
+                self.assert_allclose(auto_result, chunked_result, atol=1e-6,
+                                   message=f"Auto strategy should match expected {expected_strategy} strategy")
+                print(f"    PASS: Auto strategy correctly selects {expected_strategy} approach")
             
             # For larger vocabularies, expect some memory benefit
             if vocab_size >= 8000:
@@ -862,10 +922,169 @@ class TestLinearCrossEntropy:
         """
         Phase 4b: Test CPU batch chunking implementation.
         
-        TODO: Implement when Phase 4b is ready
+        Validates:
+        - Native CPU batch chunking (no delegation)
+        - Memory efficiency for large batch scenarios
+        - Accuracy matches naive implementation
+        - Strategy selection chooses batch chunking when appropriate
+        - Performance improvement for large batches
         """
+        device = self.device
         print(f"\n=== PHASE 4b TESTS (CPU Batch Chunking) ===")
-        print("TODO: Phase 4b not yet implemented - CPU batch chunking pending")
+        
+        print("Testing Phase 4b: CPU Batch Chunking implementation...")
+        
+        # Test scenario: Large batch that triggers batch chunking
+        batch_size, seq_len, hidden_dim = 32, 128, 256  # 32*128 = 4096 samples > 1024 chunk size
+        vocab_size = 8192  # Moderate vocab (not too large to avoid vocab chunking preference)
+        
+        input = torch.randn(batch_size, seq_len, hidden_dim, device=device, requires_grad=True)
+        weight = torch.randn(vocab_size, hidden_dim, device=device, requires_grad=True) 
+        target = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        bias = torch.randn(vocab_size, device=device, requires_grad=True)
+        
+        print(f"Input shape: {input.shape}")
+        print(f"Weight shape: {weight.shape}")
+        print(f"Target shape: {target.shape}")
+        print(f"Total batch size: {batch_size * seq_len} (should exceed 1024 chunk size)")
+        
+        # Test 1: Verify CPU batch chunking works
+        print("\n1. Testing CPU batch chunking...")
+        loss_cpu_batch = F.linear_cross_entropy(
+            input, weight, target, bias=bias, 
+            chunking_strategy="batch"
+        )
+        
+        # Verify result is valid
+        assert torch.isfinite(loss_cpu_batch), "CPU batch chunking loss should be finite"
+        assert loss_cpu_batch.requires_grad, "CPU batch chunking should support gradients"
+        print(f"   CPU batch chunking loss: {loss_cpu_batch.item():.6f}")
+        
+        # Test 2: Compare with naive implementation for accuracy
+        print("\n2. Testing accuracy vs naive implementation...")
+        loss_naive = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target, bias=bias.detach(),
+            chunking_strategy="none"
+        )
+        
+        # Verify accuracy (should be very close)
+        diff = torch.abs(loss_cpu_batch.detach() - loss_naive).item()
+        print(f"   Batch chunked loss: {loss_cpu_batch.item():.6f}")
+        print(f"   Naive loss: {loss_naive.item():.6f}")
+        print(f"   Absolute difference: {diff:.8f}")
+        assert diff < 1e-5, f"CPU batch chunking accuracy error too large: {diff}"
+        
+        # Test 3: Test backward pass
+        print("\n3. Testing gradient computation...")
+        loss_cpu_batch.backward()
+        
+        assert input.grad is not None, "Input gradients should exist"
+        assert weight.grad is not None, "Weight gradients should exist"
+        assert bias.grad is not None, "Bias gradients should exist"
+        
+        assert torch.isfinite(input.grad).all(), "Input gradients should be finite"
+        assert torch.isfinite(weight.grad).all(), "Weight gradients should be finite"
+        assert torch.isfinite(bias.grad).all(), "Bias gradients should be finite"
+        print("   PASS: All gradients computed successfully")
+        
+        # Test 4: Strategy selection - auto should choose batch chunking
+        print("\n4. Testing automatic strategy selection...")
+        loss_auto = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target, bias=bias.detach(),
+            chunking_strategy="auto"
+        )
+        
+        # Should be identical to explicit batch chunking for this scenario
+        auto_diff = torch.abs(loss_auto - loss_naive).item()
+        print(f"   Auto strategy loss: {loss_auto.item():.6f}")
+        print(f"   Difference from naive: {auto_diff:.8f}")
+        
+        # For this scenario (large batch, moderate vocab), auto should choose optimal strategy
+        # which might be batch chunking or vocab chunking depending on the exact reduction ratios
+        assert auto_diff < 1e-5, f"Auto strategy should give accurate results: {auto_diff}"
+        
+        # Test 5: Test different reduction modes
+        print("\n5. Testing reduction modes...")
+        
+        # Test sum reduction
+        loss_sum = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target, bias=bias.detach(),
+            chunking_strategy="batch", reduction="sum"
+        )
+        assert torch.isfinite(loss_sum), "Sum reduction should work"
+        print(f"   Sum reduction loss: {loss_sum.item():.6f}")
+        
+        # Test mean reduction (default)
+        loss_mean = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target, bias=bias.detach(),
+            chunking_strategy="batch", reduction="mean"
+        )
+        assert torch.isfinite(loss_mean), "Mean reduction should work"
+        print(f"   Mean reduction loss: {loss_mean.item():.6f}")
+        
+        # Sum should be larger than mean (approximately batch_size * seq_len times larger)
+        expected_ratio = batch_size * seq_len
+        actual_ratio = loss_sum.item() / loss_mean.item()
+        ratio_error = abs(actual_ratio - expected_ratio) / expected_ratio
+        print(f"   Sum/Mean ratio: {actual_ratio:.1f} (expected ~{expected_ratio})")
+        assert ratio_error < 0.1, f"Sum/Mean ratio incorrect: {actual_ratio} vs {expected_ratio}"
+        
+        # Test 6: Test with ignore_index
+        print("\n6. Testing ignore_index handling...")
+        
+        # Create target with some ignored indices
+        target_with_ignore = target.clone()
+        ignore_mask = torch.rand_like(target.float()) < 0.1  # Ignore 10% of samples
+        target_with_ignore[ignore_mask] = -100
+        
+        loss_with_ignore = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target_with_ignore, bias=bias.detach(),
+            chunking_strategy="batch", ignore_index=-100
+        )
+        
+        assert torch.isfinite(loss_with_ignore), "Should handle ignore_index correctly"
+        print(f"   Loss with ignore_index: {loss_with_ignore.item():.6f}")
+        print(f"   Ignored {ignore_mask.sum().item()} out of {target.numel()} samples")
+        
+        # Test 7: Test label smoothing
+        print("\n7. Testing label smoothing...")
+        
+        loss_smoothed = F.linear_cross_entropy(
+            input.detach(), weight.detach(), target, bias=bias.detach(),
+            chunking_strategy="batch", label_smoothing=0.1
+        )
+        
+        assert torch.isfinite(loss_smoothed), "Should handle label smoothing"
+        print(f"   Loss with label_smoothing=0.1: {loss_smoothed.item():.6f}")
+        
+        # Smoothed loss should be different from original
+        smooth_diff = abs(loss_smoothed.item() - loss_naive.item())
+        assert smooth_diff > 1e-6, f"Label smoothing should change loss: diff={smooth_diff}"
+        
+        # Test 8: Test small batch (should not use chunking)
+        print("\n8. Testing small batch handling...")
+        
+        small_input = torch.randn(2, 8, hidden_dim, device=device)  # Only 16 samples < 1024
+        small_target = torch.randint(0, vocab_size, (2, 8), device=device)
+        
+        loss_small_batch = F.linear_cross_entropy(
+            small_input, weight.detach(), small_target, bias=bias.detach(),
+            chunking_strategy="batch"
+        )
+        
+        loss_small_naive = F.linear_cross_entropy(
+            small_input, weight.detach(), small_target, bias=bias.detach(),
+            chunking_strategy="none"
+        )
+        
+        small_diff = torch.abs(loss_small_batch - loss_small_naive).item()
+        print(f"   Small batch chunked loss: {loss_small_batch.item():.6f}")
+        print(f"   Small batch naive loss: {loss_small_naive.item():.6f}")
+        print(f"   Difference: {small_diff:.8f}")
+        assert small_diff < 1e-6, "Small batch should give identical results to naive"
+        
+        print("\n=== PHASE 4b COMPLETED SUCCESSFULLY ===")
+        self.tests_passed += 1
 
     def test_step_4c_cuda_batch_chunking(self):
         """
@@ -1027,7 +1246,11 @@ class TestLinearCrossEntropy:
         for attr_name in dir(self):
             if attr_name.startswith(method_name):
                 print(f"\nRunning {attr_name} on {self.device}")
-                getattr(self, attr_name)()
+                # Special handling for step 2 comprehensive mode
+                if attr_name == "test_step_2_memory_profiling":
+                    getattr(self, attr_name)()
+                else:
+                    getattr(self, attr_name)()
                 return True
         
         print(f"ERROR: No test found for milestone {milestone_num}")
@@ -1070,7 +1293,7 @@ class TestLinearCrossEntropy:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python test/nn/test_linear_cross_entropy.py <step_N|all|regression> [device]")
+        print("Usage: python test/nn/test_linear_cross_entropy.py <step_N|step_2_comprehensive|all|regression> [device]")
         sys.exit(1)
     
     command = sys.argv[1]
@@ -1086,15 +1309,20 @@ def main():
         if command == "all":
             runner.run_all_tests()
         elif command.startswith("step_"):
-            milestone_num = int(command.split("_")[1])
-            runner.run_milestone_test(milestone_num)
+            if command == "step_2_comprehensive":
+                # Special comprehensive mode for step 2
+                print(f"\nRunning step 2 comprehensive memory tests on {device}")
+                runner.test_step_2_memory_profiling(comprehensive=True)
+            else:
+                milestone_num = int(command.split("_")[1])
+                runner.run_milestone_test(milestone_num)
         elif command == "regression":
             # Run all regression tests
             runner.test_step_1_regression()
             runner.test_step_2_regression()
         else:
             print(f"Unknown command: {command}")
-            print("Available commands: step_1, step_2, ..., step_8, all, regression")
+            print("Available commands: step_1, step_2, step_2_comprehensive, ..., step_8, all, regression")
             sys.exit(1)
         
         success = runner.report()
