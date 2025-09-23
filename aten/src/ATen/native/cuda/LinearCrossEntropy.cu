@@ -445,7 +445,7 @@ inline void scale_grad_chunk_cuda(
 
 // GPU vocabulary chunking backward: rebuild logsumexp using the same streaming
 // pass as forward, then revisit each vocabulary slice to accumulate gradients.
-inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
+inline std::tuple<Tensor, Tensor, std::optional<Tensor>> backward_vocabulary_chunking_cuda(
     const Tensor& input,
     const Tensor& weight,
     const Tensor& target,
@@ -466,7 +466,11 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
     Tensor grad_input = zeros_like_tensor_cuda(input);
     Tensor grad_weight = zeros_like_tensor_cuda(weight);
     Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
-    return {grad_input, grad_weight, grad_bias};
+    std::optional<Tensor> grad_bias_opt;
+    if (grad_bias.defined()) {
+      grad_bias_opt = std::move(grad_bias);
+    }
+    return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
   }
 
   const int64_t vocab_size = weight.size(0);
@@ -536,12 +540,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
   }
 
   grad_input = grad_input.view_as(input);
-  return {grad_input, grad_weight, grad_bias};
+  std::optional<Tensor> grad_bias_opt;
+  if (grad_bias.defined()) {
+    grad_bias_opt = std::move(grad_bias);
+  }
+  return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
 }
 
 // GPU batch chunking backward mirrors the CPU implementation but keeps the
 // working set on device by visiting at most `chunk_size` rows at a time.
-inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
+inline std::tuple<Tensor, Tensor, std::optional<Tensor>> backward_batch_chunking_cuda(
     const Tensor& input,
     const Tensor& weight,
     const Tensor& target,
@@ -560,7 +568,11 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
     Tensor grad_input = zeros_like_tensor_cuda(input);
     Tensor grad_weight = zeros_like_tensor_cuda(weight);
     Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
-    return {grad_input, grad_weight, grad_bias};
+    std::optional<Tensor> grad_bias_opt;
+    if (grad_bias.defined()) {
+      grad_bias_opt = std::move(grad_bias);
+    }
+    return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
   }
 
   Tensor grad_input = zeros_like_tensor_cuda(input_flat);
@@ -613,12 +625,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
   }
 
   grad_input = grad_input.view_as(input);
-  return {grad_input, grad_weight, grad_bias};
+  std::optional<Tensor> grad_bias_opt;
+  if (grad_bias.defined()) {
+    grad_bias_opt = std::move(grad_bias);
+  }
+  return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
 }
 
 } // anonymous namespace
 
-std::tuple<Tensor, Tensor, Tensor> linear_cross_entropy_backward_cuda(
+std::tuple<Tensor, Tensor, std::optional<Tensor>> linear_cross_entropy_backward_cuda(
     const Tensor& grad_output,
     const Tensor& input,
     const Tensor& weight,

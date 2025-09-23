@@ -195,7 +195,7 @@ Tensor linear_cross_entropy_cpu(
     int64_t ignore_index,
     double label_smoothing,
     c10::string_view chunking_strategy) {
-  
+
   // Validate inputs
   TORCH_CHECK(input.dim() >= 2, "Expected input to have at least 2 dimensions, got ", input.dim());
   TORCH_CHECK(weight.dim() == 2, "Expected weight to be 2-dimensional, got ", weight.dim());
@@ -432,7 +432,7 @@ inline void scale_grad_chunk(
 // first pass to rebuild the per-sample logsumexp using the same streaming scheme
 // as the forward kernel, then revisit each chunk to accumulate gradients for the
 // input, weight and (optional) bias tensors.
-inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
+inline std::tuple<Tensor, Tensor, std::optional<Tensor>> backward_vocabulary_chunking(
     const Tensor& input,
     const Tensor& weight,
     const Tensor& target,
@@ -453,7 +453,11 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
     Tensor grad_input = zeros_like_tensor(input);
     Tensor grad_weight = zeros_like_tensor(weight);
     Tensor grad_bias = zeros_like_or_undef(bias_opt);
-    return {grad_input, grad_weight, grad_bias};
+    std::optional<Tensor> grad_bias_opt;
+    if (grad_bias.defined()) {
+      grad_bias_opt = std::move(grad_bias);
+    }
+    return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
   }
 
   const int64_t vocab_size = weight.size(0);
@@ -523,13 +527,17 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
   }
 
   grad_input = grad_input.view_as(input);
-  return {grad_input, grad_weight, grad_bias};
+  std::optional<Tensor> grad_bias_opt;
+  if (grad_bias.defined()) {
+    grad_bias_opt = std::move(grad_bias);
+  }
+  return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
 }
 
 // Computes gradients when we chunked the batch dimension (or not at all).  The
 // loop keeps the working set bounded by `chunk_size` rows so that we never
 // allocate a full [N, vocab] buffer even when the batch is very large.
-inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
+inline std::tuple<Tensor, Tensor, std::optional<Tensor>> backward_batch_chunking(
     const Tensor& input,
     const Tensor& weight,
     const Tensor& target,
@@ -548,7 +556,11 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
     Tensor grad_input = zeros_like_tensor(input);
     Tensor grad_weight = zeros_like_tensor(weight);
     Tensor grad_bias = zeros_like_or_undef(bias_opt);
-    return {grad_input, grad_weight, grad_bias};
+    std::optional<Tensor> grad_bias_opt;
+    if (grad_bias.defined()) {
+      grad_bias_opt = std::move(grad_bias);
+    }
+    return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
   }
 
   Tensor grad_input = zeros_like_tensor(input_flat);
@@ -602,12 +614,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
   }
 
   grad_input = grad_input.view_as(input);
-  return {grad_input, grad_weight, grad_bias};
+  std::optional<Tensor> grad_bias_opt;
+  if (grad_bias.defined()) {
+    grad_bias_opt = std::move(grad_bias);
+  }
+  return std::make_tuple(grad_input, grad_weight, std::move(grad_bias_opt));
 }
 
 } // anonymous namespace
 
-std::tuple<Tensor, Tensor, Tensor> linear_cross_entropy_backward_cpu(
+std::tuple<Tensor, Tensor, std::optional<Tensor>> linear_cross_entropy_backward_cpu(
     const Tensor& grad_output,
     const Tensor& input,
     const Tensor& weight,
@@ -617,6 +633,7 @@ std::tuple<Tensor, Tensor, Tensor> linear_cross_entropy_backward_cpu(
     int64_t ignore_index,
     double label_smoothing,
     c10::string_view chunking_strategy) {
+
   TORCH_CHECK(input.dim() >= 2, "Expected input to have at least 2 dimensions, got ", input.dim());
   TORCH_CHECK(weight.dim() == 2, "Expected weight to be 2-dimensional, got ", weight.dim());
   TORCH_CHECK(input.size(-1) == weight.size(1),
