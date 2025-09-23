@@ -192,6 +192,31 @@ class TestLinearCrossEntropy:
                     self.assert_true(result.requires_grad, "Result should require gradients")
         print("PASS: Milestone 1 regression test")
 
+    def test_reduction_none_matches_naive(self):
+        """Ensure reduction='none' matches naive implementation for large vocab scenario."""
+        batch, seq, hidden, vocab = 3, 4, 16, 9000
+        input_tensor = torch.randn(batch, seq, hidden, device=self.device)
+        weight_tensor = torch.randn(vocab, hidden, device=self.device)
+        target_tensor = torch.randint(0, vocab, (batch, seq), device=self.device)
+
+        fused_loss = F.linear_cross_entropy(
+            input_tensor,
+            weight_tensor,
+            target_tensor,
+            reduction="none",
+            chunking_strategy="vocab",
+        )
+
+        logits = F.linear(input_tensor, weight_tensor)
+        naive_loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            target_tensor.view(-1),
+            reduction="none",
+        ).view_as(target_tensor)
+
+        self.assert_allclose(fused_loss, naive_loss, atol=1e-5, message="reduction='none' should align with naive output")
+        print("PASS: reduction='none' matches naive cross entropy")
+
     def _measure_peak_memory(self, operation_fn):
         """
         Utility to measure peak memory usage of an operation.
@@ -765,6 +790,26 @@ class TestLinearCrossEntropy:
         
         self.assert_allclose(loss_chunked_large, loss_ref_large, atol=1e-4, message="Large vocab chunking correctness")
         print("PASS: Large vocabulary test")
+
+        loss_ref_large_smoothed = F.cross_entropy(
+            logits_ref_large_flat,
+            target_large_flat,
+            label_smoothing=0.2,
+        )
+        loss_chunked_large_smoothed = F.linear_cross_entropy(
+            input_large,
+            weight_large,
+            target_large,
+            chunking_strategy="vocab",
+            label_smoothing=0.2,
+        )
+        self.assert_allclose(
+            loss_chunked_large_smoothed,
+            loss_ref_large_smoothed,
+            atol=1e-4,
+            message="Large vocab with label smoothing should match",
+        )
+        print("PASS: Large vocabulary label smoothing test")
         
         # Test 3.5: Strategy consistency test
         print("\nTest 3.5: Strategy consistency test")
@@ -973,6 +1018,26 @@ class TestLinearCrossEntropy:
         print(f"   Naive loss: {loss_naive.item():.6f}")
         print(f"   Absolute difference: {diff:.8f}")
         assert diff < 1e-5, f"CPU batch chunking accuracy error too large: {diff}"
+
+        loss_naive_smoothed = F.linear_cross_entropy(
+            input.detach(),
+            weight.detach(),
+            target,
+            bias=bias.detach(),
+            chunking_strategy="none",
+            label_smoothing=0.15,
+        )
+        loss_batch_smoothed = F.linear_cross_entropy(
+            input.detach(),
+            weight.detach(),
+            target,
+            bias=bias.detach(),
+            chunking_strategy="batch",
+            label_smoothing=0.15,
+        )
+        smoothed_diff = torch.abs(loss_naive_smoothed - loss_batch_smoothed).item()
+        assert smoothed_diff < 1e-5, f"Label smoothing mismatch for batch chunking: {smoothed_diff}"
+        print("   PASS: Batch chunking matches naive with label smoothing")
         
         # Test 3: Test backward pass
         print("\n3. Testing gradient computation...")

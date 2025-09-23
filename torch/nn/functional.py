@@ -3536,20 +3536,35 @@ def linear_cross_entropy(
     if chunking_strategy not in ("auto", "vocab", "batch", "none"):
         raise ValueError(f"chunking_strategy must be one of ('auto', 'vocab', 'batch', 'none'), got '{chunking_strategy}'")
     
-    # For now, implement naive fallback using separate linear + cross_entropy
-    # This will be replaced with optimized implementations in subsequent milestones
-    logits = torch.nn.functional.linear(input, weight, bias)
-    
-    # Reshape tensors for cross_entropy: logits [N, C] and target [N]
-    logits_flat = logits.view(-1, logits.size(-1))  # [N, C]
-    target_flat = target.view(-1)                   # [N]
-    
-    return torch.nn.functional.cross_entropy(
-        logits_flat, 
-        target_flat, 
-        reduction=reduction, 
-        ignore_index=ignore_index,
-        label_smoothing=label_smoothing
+    reduction_enum = _Reduction.get_enum(reduction)
+
+    needs_grad = torch.is_grad_enabled() and (
+        input.requires_grad
+        or weight.requires_grad
+        or (bias is not None and bias.requires_grad)
+    )
+
+    if needs_grad:
+        return _LinearCrossEntropyAutograd.apply(
+            input,
+            weight,
+            target,
+            bias,
+            reduction_enum,
+            ignore_index,
+            label_smoothing,
+            chunking_strategy,
+        )
+
+    return torch.ops.aten.linear_cross_entropy(
+        input,
+        weight,
+        target,
+        bias,
+        reduction_enum,
+        ignore_index,
+        label_smoothing,
+        chunking_strategy,
     )
 
 
@@ -6585,3 +6600,224 @@ def multi_head_attention_forward(
             # squeeze the output if input was unbatched
             attn_output = attn_output.squeeze(1)
         return attn_output, None
+
+
+class _LinearCrossEntropyAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input,
+        weight,
+        target,
+        bias,
+        reduction_enum,
+        ignore_index,
+        label_smoothing,
+        chunking_strategy,
+    ):
+        bias_to_save = bias if bias is not None else input.new_zeros(0, dtype=input.dtype)
+        ctx.has_bias = bias is not None
+        ctx.ignore_index = ignore_index
+        ctx.label_smoothing = label_smoothing
+        ctx.reduction_enum = reduction_enum
+        ctx.chunking_strategy = chunking_strategy
+        ctx.save_for_backward(input, weight, bias_to_save, target)
+        return torch.ops.aten.linear_cross_entropy(
+            input,
+            weight,
+            target,
+            bias,
+            reduction_enum,
+            ignore_index,
+            label_smoothing,
+            chunking_strategy,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight, bias_saved, target = ctx.saved_tensors
+        bias = bias_saved if ctx.has_bias else None
+        grad_input, grad_weight, grad_bias = torch.ops.aten.linear_cross_entropy_backward(
+            grad_output,
+            input,
+            weight,
+            target,
+            bias,
+            ctx.reduction_enum,
+            ctx.ignore_index,
+            ctx.label_smoothing,
+            ctx.chunking_strategy,
+        )
+
+        if ctx.has_bias:
+            return (
+                grad_input,
+                grad_weight,
+                None,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+            )
+        return (
+            grad_input,
+            grad_weight,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+def _select_linear_ce_strategy(input: Tensor, weight: Tensor, chunking_strategy: str) -> str:
+    if chunking_strategy in ("none", "vocab", "batch"):
+        return chunking_strategy
+    if chunking_strategy != "auto":
+        raise ValueError(f"Unsupported chunking strategy '{chunking_strategy}'")
+
+    vocab_size = weight.size(0)
+    batch_size = input.size(0)
+    seq_len = input.size(1) if input.dim() == 3 else 1
+
+    vocab_chunk_size = 4096
+    batch_chunk_size = 1024
+
+    vocab_large = vocab_size > vocab_chunk_size
+    total_batch = batch_size * seq_len
+    batch_large = total_batch > batch_chunk_size
+
+    if not vocab_large and not batch_large:
+        return "none"
+    if vocab_large and not batch_large:
+        return "vocab"
+    if not vocab_large and batch_large:
+        return "batch"
+
+    vocab_reduction = 1.0 - float(vocab_chunk_size) / float(vocab_size)
+    batch_reduction = 1.0 - float(batch_chunk_size) / float(total_batch)
+    return "vocab" if vocab_reduction >= batch_reduction else "batch"
+
+
+def _linear_ce_backward_vocabulary(
+    input: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    target: Tensor,
+    grad_output: Tensor,
+    reduction: str,
+    ignore_index: int,
+    label_smoothing: float,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    input_flat = input.view(-1, input.size(-1))
+    target_flat = target.view(-1)
+    valid_mask = target_flat != ignore_index
+
+    vocab_size = weight.size(0)
+    chunk_size = 4096
+    num_chunks = (vocab_size + chunk_size - 1) // chunk_size
+
+    running_max = input_flat.new_full((input_flat.size(0),), float("-inf"))
+    exp_sums = input_flat.new_zeros(input_flat.size(0))
+
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, vocab_size)
+        weight_chunk = weight[start_idx:end_idx]
+        bias_chunk = bias[start_idx:end_idx] if bias is not None else None
+        logits_chunk = torch.nn.functional.linear(input_flat, weight_chunk, bias_chunk)
+        chunk_max = logits_chunk.max(dim=1).values
+        new_max = torch.maximum(running_max, chunk_max)
+        exp_scale_old = torch.exp(running_max - new_max)
+        shifted = logits_chunk - new_max.unsqueeze(1)
+        exp_chunk = torch.exp(shifted).sum(dim=1)
+        exp_sums = exp_sums * exp_scale_old + exp_chunk
+        running_max = new_max
+
+    logsumexp = running_max + exp_sums.log()
+
+    grad_input = torch.zeros_like(input_flat)
+    grad_weight = torch.zeros_like(weight)
+    grad_bias = torch.zeros_like(bias) if bias is not None else None
+
+    uniform_component = label_smoothing / weight.size(0) if label_smoothing > 0.0 else 0.0
+    grad_output_flat = grad_output.reshape(-1)
+
+    for chunk_idx in range(num_chunks):
+        start_idx = chunk_idx * chunk_size
+        end_idx = min(start_idx + chunk_size, vocab_size)
+        weight_chunk = weight[start_idx:end_idx]
+        bias_chunk = bias[start_idx:end_idx] if bias is not None else None
+        logits_chunk = torch.nn.functional.linear(input_flat, weight_chunk, bias_chunk)
+        prob_chunk = torch.exp(logits_chunk - logsumexp.unsqueeze(1))
+
+        if label_smoothing > 0.0:
+            grad_chunk = prob_chunk - uniform_component
+        else:
+            grad_chunk = prob_chunk
+
+        grad_chunk = grad_chunk * valid_mask.to(grad_chunk.dtype).unsqueeze(1)
+
+        target_chunk_mask = valid_mask & (target_flat >= start_idx) & (target_flat < end_idx)
+        if target_chunk_mask.any():
+            rows = torch.nonzero(target_chunk_mask, as_tuple=False).squeeze(1)
+            local_targets = (target_flat[rows] - start_idx).long()
+            grad_chunk[rows, local_targets] -= (1.0 - label_smoothing)
+
+        if reduction == "none":
+            grad_chunk = grad_chunk * grad_output_flat.to(grad_chunk.dtype).unsqueeze(1)
+        elif reduction == "sum":
+            grad_chunk = grad_chunk * grad_output.to(grad_chunk.dtype)
+        else:
+            valid_count = max(int(valid_mask.sum().item()), 1)
+            grad_chunk = grad_chunk * (grad_output.to(grad_chunk.dtype) / float(valid_count))
+
+        grad_input = grad_input + grad_chunk.matmul(weight_chunk)
+        grad_weight[start_idx:end_idx] += grad_chunk.transpose(0, 1).matmul(input_flat)
+        if grad_bias is not None:
+            grad_bias[start_idx:end_idx] += grad_chunk.sum(dim=0)
+
+    grad_input = grad_input.view_as(input)
+    return grad_input, grad_weight, grad_bias
+
+
+def _linear_ce_backward_no_chunk(
+    input: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor],
+    target: Tensor,
+    grad_output: Tensor,
+    reduction: str,
+    ignore_index: int,
+    label_smoothing: float,
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    input_flat = input.view(-1, input.size(-1))
+    target_flat = target.view(-1)
+    valid_mask = target_flat != ignore_index
+
+    logits = torch.nn.functional.linear(input_flat, weight, bias)
+    logsumexp = torch.logsumexp(logits, dim=1)
+    prob = torch.exp(logits - logsumexp.unsqueeze(1))
+
+    if label_smoothing > 0.0:
+        grad_logits = prob - (label_smoothing / weight.size(0))
+    else:
+        grad_logits = prob
+
+    grad_logits = grad_logits * valid_mask.to(prob.dtype).unsqueeze(1)
+    rows = torch.nonzero(valid_mask, as_tuple=False).squeeze(1)
+    if rows.numel() > 0:
+        grad_logits[rows, target_flat[rows]] -= (1.0 - label_smoothing)
+
+    if reduction == "none":
+        grad_logits = grad_logits * grad_output.reshape(-1).to(grad_logits.dtype).unsqueeze(1)
+    elif reduction == "sum":
+        grad_logits = grad_logits * grad_output.to(grad_logits.dtype)
+    else:
+        valid_count = max(int(valid_mask.sum().item()), 1)
+        grad_logits = grad_logits * (grad_output.to(grad_logits.dtype) / float(valid_count))
+
+    grad_input = grad_logits.matmul(weight).view_as(input)
+    grad_weight = grad_logits.transpose(0, 1).matmul(input_flat)
+    grad_bias = grad_logits.sum(dim=0) if bias is not None else None
+    return grad_input, grad_weight, grad_bias
