@@ -49,6 +49,19 @@ enum class ChunkingStrategy {
     BATCH_CHUNKING
 };
 
+// Shared thresholds for chunking decisions (kept in sync with CPU implementation)
+constexpr int64_t kVocabChunkSize = 4096;
+constexpr int64_t kBatchChunkSize = 1024;
+
+Tensor naive_linear_cross_entropy_cuda(
+    const Tensor& input,
+    const Tensor& weight,
+    const Tensor& target,
+    const std::optional<Tensor>& bias_opt,
+    int64_t reduction,
+    int64_t ignore_index,
+    double label_smoothing);
+
 // Forward declarations
 Tensor batch_chunking_cuda(
     const Tensor& input,
@@ -59,20 +72,42 @@ Tensor batch_chunking_cuda(
     int64_t ignore_index,
     double label_smoothing);
 
-// Utility functions for strategy selection heuristics
-// Based on empirical analysis from memory profiling (Milestone 2) and CPU implementation
-inline bool should_use_vocab_chunking_cuda(int64_t vocab_size, int64_t batch_size) {
-  // Use vocabulary chunking for large vocabularies (LLM training scenarios)
-  // Threshold based on proven CPU implementation and memory constraints
-  return vocab_size > 8192;
-}
+// Strategy selection helper mirroring the CPU heuristics so "auto" behaves
+// consistently across devices.
+inline ChunkingStrategy select_chunking_strategy_cuda(
+    int64_t vocab_size,
+    int64_t total_batch_size,
+    c10::string_view strategy) {
+  if (strategy == "none") {
+    return ChunkingStrategy::NAIVE;
+  }
+  if (strategy == "vocab") {
+    return ChunkingStrategy::VOCAB_CHUNKING;
+  }
+  if (strategy == "batch") {
+    return ChunkingStrategy::BATCH_CHUNKING;
+  }
+  TORCH_CHECK(strategy == "auto",
+      "Unknown chunking strategy: ", strategy,
+      ". Valid options: 'auto', 'vocab', 'batch', 'none'");
 
-inline bool should_use_batch_chunking_cuda(int64_t vocab_size, int64_t batch_size) {
-  // Use batch chunking for large batches with moderate vocabularies (fine-tuning scenarios)
-  // Mirrors CPU implementation logic: batch_large && !vocab_large
-  const int64_t batch_chunk_threshold = 1024;
-  const int64_t vocab_chunk_threshold = 8192;
-  return batch_size > batch_chunk_threshold && vocab_size <= vocab_chunk_threshold;
+  const bool vocab_large = vocab_size > kVocabChunkSize;
+  const bool batch_large = total_batch_size > kBatchChunkSize;
+
+  if (!vocab_large && !batch_large) {
+    return ChunkingStrategy::NAIVE;
+  }
+  if (vocab_large && !batch_large) {
+    return ChunkingStrategy::VOCAB_CHUNKING;
+  }
+  if (!vocab_large && batch_large) {
+    return ChunkingStrategy::BATCH_CHUNKING;
+  }
+
+  const double vocab_reduction = 1.0 - static_cast<double>(kVocabChunkSize) / static_cast<double>(vocab_size);
+  const double batch_reduction = 1.0 - static_cast<double>(kBatchChunkSize) / static_cast<double>(total_batch_size);
+  return (vocab_reduction >= batch_reduction) ? ChunkingStrategy::VOCAB_CHUNKING
+                                              : ChunkingStrategy::BATCH_CHUNKING;
 }
 
 // CUDA vocabulary chunking implementation
@@ -110,7 +145,23 @@ Tensor vocab_chunking_cuda(
   const auto valid_mask = at::ne(target_flat, ignore_index);
 
   const int64_t vocab_size = weight.size(0);
-  const int64_t chunk_size = 4096;
+  const int64_t chunk_size = kVocabChunkSize;
+
+  // When the vocabulary easily fits into a single chunk there is no benefit to
+  // running the streaming algorithm. Fall back to the naive path to avoid the
+  // extra kernel launches that triggered the small-model slowdown alert in the
+  // CUDA milestone tests.
+  if (vocab_size <= chunk_size) {
+    return naive_linear_cross_entropy_cuda(
+        input,
+        weight,
+        target,
+        bias_opt,
+        reduction,
+        ignore_index,
+        label_smoothing);
+  }
+
   const int64_t num_chunks = (vocab_size + chunk_size - 1) / chunk_size;
 
   const auto options = input_flat.options();
@@ -254,21 +305,19 @@ Tensor linear_cross_entropy_cuda(
               "linear_cross_entropy_cuda: input.size(-1) must match weight.size(1)");
   
   const int64_t vocab_size = weight.size(0);
-  const int64_t batch_size = input.view({-1, input.size(-1)}).size(0);
-  
-  // Strategy selection based on input characteristics
-  if (chunking_strategy == "vocab" || 
-      (chunking_strategy == "auto" && should_use_vocab_chunking_cuda(vocab_size, batch_size))) {
-    // Use vocabulary chunking for large vocabularies (LLM training scenarios)
-    return vocab_chunking_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
-  } else if (chunking_strategy == "batch" ||
-             (chunking_strategy == "auto" && should_use_batch_chunking_cuda(vocab_size, batch_size))) {
-    // Use batch chunking for large batch sizes with moderate vocabularies (fine-tuning scenarios)
-    // Phase 4c: Native CUDA batch chunking implementation
-    return batch_chunking_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
-  } else {
-    // Use naive implementation for small models (no chunking overhead)
-    return naive_linear_cross_entropy_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
+  const int64_t batch_outer = input.size(0);
+  const int64_t seq_len = input.dim() == 3 ? input.size(1) : 1;
+  const int64_t total_batch = batch_outer * seq_len;
+
+  ChunkingStrategy resolved = select_chunking_strategy_cuda(vocab_size, total_batch, chunking_strategy);
+  switch (resolved) {
+    case ChunkingStrategy::VOCAB_CHUNKING:
+      return vocab_chunking_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
+    case ChunkingStrategy::BATCH_CHUNKING:
+      return batch_chunking_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
+    case ChunkingStrategy::NAIVE:
+    default:
+      return naive_linear_cross_entropy_cuda(input, weight, target, bias_opt, reduction, ignore_index, label_smoothing);
   }
 }
 
@@ -307,7 +356,7 @@ Tensor batch_chunking_cuda(
   const auto target_flat = target.view({-1});                // [N] flattened targets
   
   const int64_t batch_size = input_flat.size(0);
-  const int64_t chunk_size = 1024;  // Same optimal chunk size as CPU implementation (empirically validated)
+  const int64_t chunk_size = kBatchChunkSize;  // Same optimal chunk size as CPU implementation (empirically validated)
   
   // Early exit if batch is too small for chunking (mirrors CPU logic)
   // Use naive implementation to avoid chunking overhead
@@ -474,7 +523,7 @@ inline std::tuple<Tensor, Tensor, std::optional<Tensor>> backward_vocabulary_chu
   }
 
   const int64_t vocab_size = weight.size(0);
-  const int64_t chunk_size = 4096;
+  const int64_t chunk_size = kVocabChunkSize;
   const int64_t num_chunks = (vocab_size + chunk_size - 1) / chunk_size;
 
   Tensor running_max = at::full({input_flat.size(0)}, -std::numeric_limits<double>::infinity(), options).to(dtype);
@@ -650,17 +699,12 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> linear_cross_entropy_backward_
       "linear_cross_entropy_backward_cuda: input.size(-1) must match weight.size(1)");
 
   const int64_t vocab_size = weight.size(0);
-  const int64_t batch_size = input.size(0);
+  const int64_t batch_outer = input.size(0);
   const int64_t seq_len = input.dim() == 3 ? input.size(1) : 1;
-  const int64_t flattened_batch = input.view({-1, input.size(-1)}).size(0);
-  ChunkingStrategy resolved_strategy;
-  if (chunking_strategy == "vocab" ||
-      (chunking_strategy == "auto" && should_use_vocab_chunking_cuda(vocab_size, flattened_batch))) {
-    resolved_strategy = ChunkingStrategy::VOCAB_CHUNKING;
-  } else if (chunking_strategy == "batch" ||
-             (chunking_strategy == "auto" && should_use_batch_chunking_cuda(vocab_size, flattened_batch))) {
-    resolved_strategy = ChunkingStrategy::BATCH_CHUNKING;
-  } else {
+  const int64_t total_batch = batch_outer * seq_len;
+
+  ChunkingStrategy resolved_strategy = select_chunking_strategy_cuda(vocab_size, total_batch, chunking_strategy);
+  if (resolved_strategy == ChunkingStrategy::VOCAB_CHUNKING && vocab_size <= kVocabChunkSize) {
     resolved_strategy = ChunkingStrategy::NAIVE;
   }
 
@@ -676,7 +720,9 @@ std::tuple<Tensor, Tensor, std::optional<Tensor>> linear_cross_entropy_backward_
         label_smoothing);
   }
 
-  const int64_t default_chunk = resolved_strategy == ChunkingStrategy::BATCH_CHUNKING ? 1024 : input.view({-1, input.size(-1)}).size(0);
+  const int64_t default_chunk = resolved_strategy == ChunkingStrategy::BATCH_CHUNKING
+      ? kBatchChunkSize
+      : input.view({-1, input.size(-1)}).size(0);
   return backward_batch_chunking_cuda(
       input,
       weight,
