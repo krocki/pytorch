@@ -6,6 +6,8 @@
 #include <c10/util/irange.h>
 #include <limits>
 #include <tuple>
+#include <vector>
+#include <optional>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -15,11 +17,13 @@
 #include <ATen/ops/linear.h>
 #include <ATen/ops/cross_entropy_loss.h>
 #include <ATen/ops/zeros.h>
+#include <ATen/ops/zeros_like.h>
 #include <ATen/ops/full.h>
 #include <ATen/ops/ones.h>
 #include <ATen/ops/max.h>
 #include <ATen/ops/exp.h>
 #include <ATen/ops/log.h>
+#include <ATen/ops/logsumexp.h>
 #include <ATen/ops/where.h>
 #include <ATen/ops/ge.h>
 #include <ATen/ops/lt.h>
@@ -280,7 +284,7 @@ Tensor linear_cross_entropy_cpu(
       auto target_chunk_mask = at::logical_and(valid_mask, lower_bound);
       target_chunk_mask = at::logical_and(target_chunk_mask, upper_bound);
 
-      auto indices = at::nonzero(target_chunk_mask).view({-1});
+    auto indices = target_chunk_mask.nonzero().view({-1});
       if (indices.numel() > 0) {
         auto selected_targets = at::index_select(target_flat, 0, indices);
         auto local_targets = at::sub(selected_targets, start_idx);
@@ -292,7 +296,7 @@ Tensor linear_cross_entropy_cpu(
       }
     }
 
-    auto target_found_mask = at::gt(target_found, 0);
+  auto target_found_mask = target_found.gt(0);
     auto coverage_mask = at::logical_or(target_found_mask, at::logical_not(valid_mask));
     TORCH_CHECK(coverage_mask.all().item<bool>(),
         "linear_cross_entropy: target index not found in vocabulary chunks");
@@ -366,9 +370,13 @@ inline bool requires_grad_scaling_mean(int64_t reduction) {
   return reduction == Reduction::Mean;
 }
 
+inline Tensor zeros_like_tensor(const Tensor& src) {
+  return at::_ops::zeros_like::call(src, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+}
+
 inline Tensor zeros_like_or_undef(const std::optional<Tensor>& opt) {
   if (opt.has_value()) {
-    return at::zeros_like(opt.value());
+    return zeros_like_tensor(opt.value());
   }
   return Tensor();
 }
@@ -378,7 +386,8 @@ inline Tensor cast_grad_output(const Tensor& grad_output, const Tensor& input) {
 }
 
 inline Tensor mask_invalid_rows(const Tensor& tensor, const Tensor& valid_mask) {
-  return tensor * valid_mask.to(tensor.scalar_type()).unsqueeze(1);
+  auto mask = valid_mask.to(tensor.scalar_type()).unsqueeze(1);
+  return at::mul(tensor, mask);
 }
 
 inline void apply_target_updates(
@@ -390,8 +399,9 @@ inline void apply_target_updates(
   if (rows.numel() == 0) {
     return;
   }
-  auto local_targets = at::sub(at::index_select(target_flat, 0, rows), offset).to(at::kLong);
-  auto gather = grad_chunk.index({rows, local_targets}) - (1.0 - label_smoothing);
+  auto selected_targets = at::index_select(target_flat, 0, rows);
+  auto local_targets = selected_targets.add(-offset).to(at::kLong);
+  auto gather = grad_chunk.index({rows, local_targets}).add(-(1.0 - label_smoothing));
   grad_chunk.index_put_({rows, local_targets}, gather);
 }
 
@@ -414,7 +424,7 @@ inline void scale_grad_chunk(
     grad_chunk.zero_();
     return;
   }
-  auto scale = grad_output_tensor / static_cast<double>(valid_count);
+  auto scale = grad_output_tensor.div(static_cast<double>(valid_count));
   grad_chunk.mul_(scale);
 }
 
@@ -436,13 +446,12 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
   const auto target_flat = target.view({-1});
   const auto dtype = input.scalar_type();
   const auto options = input.options();
-
   Tensor valid_mask = at::ne(target_flat, ignore_index);
   const int64_t valid_count = valid_mask.sum().item<int64_t>();
 
   if (reduction == Reduction::Mean && valid_count == 0) {
-    Tensor grad_input = at::zeros_like(input);
-    Tensor grad_weight = at::zeros_like(weight);
+    Tensor grad_input = zeros_like_tensor(input);
+    Tensor grad_weight = zeros_like_tensor(weight);
     Tensor grad_bias = zeros_like_or_undef(bias_opt);
     return {grad_input, grad_weight, grad_bias};
   }
@@ -465,16 +474,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
     auto logits_chunk = at::linear(input_flat, weight_chunk, bias_chunk);
     auto chunk_max = std::get<0>(logits_chunk.max(-1));
     auto new_max = at::maximum(running_max, chunk_max);
-    auto exp_scale_old = at::exp(running_max - new_max);
-    auto shifted_logits = logits_chunk - new_max.unsqueeze(-1);
+    auto exp_scale_old = at::exp(running_max.sub(new_max));
+    auto shifted_logits = logits_chunk.sub(new_max.unsqueeze(-1));
     auto exp_chunk = at::sum(at::exp(shifted_logits), {-1});
     exp_sums = at::add(at::mul(exp_sums, exp_scale_old), exp_chunk);
     running_max = new_max;
   }
 
-  Tensor logsumexp = running_max + exp_sums.log();
-  Tensor grad_input = at::zeros_like(input_flat);
-  Tensor grad_weight = at::zeros_like(weight);
+  Tensor logsumexp = running_max.add(exp_sums.log());
+  Tensor grad_input = zeros_like_tensor(input_flat);
+  Tensor grad_weight = zeros_like_tensor(weight);
   Tensor grad_bias = zeros_like_or_undef(bias_opt);
 
   const double uniform_component = label_smoothing > 0.0 ? label_smoothing / static_cast<double>(vocab_size) : 0.0;
@@ -493,13 +502,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking(
       bias_chunk = bias_opt->slice(0, start_idx, end_idx);
     }
     auto logits_chunk = at::linear(input_flat, weight_chunk, bias_chunk);
-    auto grad_chunk = at::exp(logits_chunk - logsumexp.unsqueeze(-1));
+    auto grad_chunk = at::exp(logits_chunk.sub(logsumexp.unsqueeze(-1)));
     if (label_smoothing > 0.0) {
-      grad_chunk = at::add(grad_chunk, -uniform_component);
+      grad_chunk = grad_chunk.add(-uniform_component);
     }
     grad_chunk = mask_invalid_rows(grad_chunk, valid_mask);
-    auto target_chunk_mask = valid_mask & (target_flat >= start_idx) & (target_flat < end_idx);
-    auto rows = at::nonzero(target_chunk_mask, /*as_tuple=*/false).squeeze(-1);
+    auto lower_bound = target_flat.ge(start_idx);
+    auto upper_bound = target_flat.lt(end_idx);
+    auto target_chunk_mask = at::logical_and(valid_mask, lower_bound);
+    target_chunk_mask = at::logical_and(target_chunk_mask, upper_bound);
+    auto rows = target_chunk_mask.nonzero().squeeze(-1);
     apply_target_updates(grad_chunk, target_flat, rows, start_idx, label_smoothing);
     scale_grad_chunk(grad_chunk, grad_output_tensor, grad_output_flat, reduction, valid_count);
     grad_chunk = mask_invalid_rows(grad_chunk, valid_mask);
@@ -529,21 +541,18 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
     int64_t chunk_size) {
   const auto input_flat = input.view({-1, input.size(-1)});
   const auto target_flat = target.view({-1});
-  const auto dtype = input.scalar_type();
-  const auto options = input.options();
-
   Tensor valid_mask = at::ne(target_flat, ignore_index);
   const int64_t valid_count = valid_mask.sum().item<int64_t>();
 
   if (reduction == Reduction::Mean && valid_count == 0) {
-    Tensor grad_input = at::zeros_like(input);
-    Tensor grad_weight = at::zeros_like(weight);
+    Tensor grad_input = zeros_like_tensor(input);
+    Tensor grad_weight = zeros_like_tensor(weight);
     Tensor grad_bias = zeros_like_or_undef(bias_opt);
     return {grad_input, grad_weight, grad_bias};
   }
 
-  Tensor grad_input = at::zeros_like(input_flat);
-  Tensor grad_weight = at::zeros_like(weight);
+  Tensor grad_input = zeros_like_tensor(input_flat);
+  Tensor grad_weight = zeros_like_tensor(weight);
   Tensor grad_bias = zeros_like_or_undef(bias_opt);
 
   Tensor grad_output_tensor = cast_grad_output(grad_output, input);
@@ -561,16 +570,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
     auto target_chunk = target_flat.narrow(0, start_idx, slice);
     auto valid_mask_chunk = valid_mask.narrow(0, start_idx, slice);
     auto logits_chunk = at::linear(input_chunk, weight, bias_opt);
-    auto logsumexp_chunk = at::logsumexp(logits_chunk, 1);
-    auto grad_chunk = at::exp(logits_chunk - logsumexp_chunk.unsqueeze(-1));
+    auto logsumexp_chunk = at::_ops::logsumexp::call(logits_chunk, std::vector<int64_t>{1}, false);
+    auto grad_chunk = at::exp(logits_chunk.sub(logsumexp_chunk.unsqueeze(-1)));
     if (label_smoothing > 0.0) {
-      grad_chunk = at::add(grad_chunk, -uniform_component);
+      grad_chunk = grad_chunk.add(-uniform_component);
     }
     grad_chunk = mask_invalid_rows(grad_chunk, valid_mask_chunk);
-    auto rows = at::nonzero(valid_mask_chunk, /*as_tuple=*/false).squeeze(-1);
+    auto rows = valid_mask_chunk.nonzero().squeeze(-1);
     if (rows.numel() > 0) {
       auto targets_slice = at::index_select(target_chunk, 0, rows).to(at::kLong);
-      auto gather = grad_chunk.index({rows, targets_slice}) - (1.0 - label_smoothing);
+      auto gather = grad_chunk.index({rows, targets_slice}).add(-(1.0 - label_smoothing));
       grad_chunk.index_put_({rows, targets_slice}, gather);
     }
     Tensor grad_scale = grad_output_tensor;
@@ -582,7 +591,7 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking(
       if (valid_count == 0) {
         continue;
       }
-      grad_chunk.mul_(grad_scale / static_cast<double>(valid_count));
+      grad_chunk.mul_(grad_scale.div(static_cast<double>(valid_count)));
     }
     grad_chunk = mask_invalid_rows(grad_chunk, valid_mask_chunk);
     grad_input.narrow(0, start_idx, slice).add_(grad_chunk.matmul(weight));

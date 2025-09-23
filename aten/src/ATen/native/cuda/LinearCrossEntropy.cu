@@ -3,6 +3,8 @@
 #include <ATen/Dispatch.h>
 #include <limits>
 #include <tuple>
+#include <vector>
+#include <optional>
 
 #ifndef AT_PER_OPERATOR_HEADERS
 #include <ATen/Functions.h>
@@ -12,11 +14,13 @@
 #include <ATen/ops/linear.h>
 #include <ATen/ops/cross_entropy_loss.h>
 #include <ATen/ops/zeros.h>
+#include <ATen/ops/zeros_like.h>
 #include <ATen/ops/full.h>
 #include <ATen/ops/ones.h>
 #include <ATen/ops/max.h>
 #include <ATen/ops/exp.h>
 #include <ATen/ops/log.h>
+#include <ATen/ops/logsumexp.h>
 #include <ATen/ops/logical_and.h>
 #include <ATen/ops/logical_or.h>
 #include <ATen/ops/logical_not.h>
@@ -38,6 +42,12 @@
 #endif
 
 namespace at::native {
+
+enum class ChunkingStrategy {
+    NAIVE,
+    VOCAB_CHUNKING,
+    BATCH_CHUNKING
+};
 
 // Forward declarations
 Tensor batch_chunking_cuda(
@@ -142,15 +152,15 @@ Tensor vocab_chunking_cuda(
     exp_sums = at::add(at::mul(exp_sums, exp_scale_old), exp_chunk);
     running_max = new_max;
 
-    auto lower_bound = at::ge(target_flat, start_idx);
-    auto upper_bound = at::lt(target_flat, end_idx);
+    auto lower_bound = target_flat.ge(start_idx);
+    auto upper_bound = target_flat.lt(end_idx);
     auto target_chunk_mask = at::logical_and(valid_mask, lower_bound);
     target_chunk_mask = at::logical_and(target_chunk_mask, upper_bound);
 
-    auto indices = at::nonzero(target_chunk_mask).view({-1});
+    auto indices = target_chunk_mask.nonzero().view({-1});
     if (indices.numel() > 0) {
       auto selected_targets = at::index_select(target_flat, 0, indices);
-      auto local_targets = at::sub(selected_targets, start_idx);
+      auto local_targets = selected_targets.add(-start_idx);
       auto selected_logits = at::index_select(logits_chunk, 0, indices);
       auto gathered = at::gather(selected_logits, 1, local_targets.unsqueeze(1)).squeeze(1);
       target_logits.index_put_({indices}, gathered);
@@ -159,22 +169,22 @@ Tensor vocab_chunking_cuda(
     }
   }
 
-  auto target_found_mask = at::gt(target_found, 0);
+  auto target_found_mask = target_found.gt(0);
   auto coverage_mask = at::logical_or(target_found_mask, at::logical_not(valid_mask));
   TORCH_CHECK(coverage_mask.all().item<bool>(),
       "linear_cross_entropy_cuda: target index not found in vocabulary chunks");
 
-  auto logsumexp = at::add(running_max, at::log(exp_sums));
+  auto logsumexp = running_max.add(exp_sums.log());
   Tensor losses;
   if (label_smoothing > 0.0) {
     const double smoothing = label_smoothing;
     const double uniform = smoothing / static_cast<double>(vocab_size);
-    auto main_term = at::mul(target_logits, 1.0 - smoothing);
-    auto uniform_term = at::mul(sum_logits, uniform);
-    losses = at::sub(logsumexp, main_term);
-    losses = at::sub(losses, uniform_term);
+    auto main_term = target_logits.mul(1.0 - smoothing);
+    auto uniform_term = sum_logits.mul(uniform);
+    losses = logsumexp.sub(main_term);
+    losses = losses.sub(uniform_term);
   } else {
-    losses = at::sub(logsumexp, target_logits);
+    losses = logsumexp.sub(target_logits);
   }
 
   auto invalid_mask = at::logical_not(valid_mask);
@@ -193,7 +203,7 @@ Tensor vocab_chunking_cuda(
   if (valid_count == 0) {
     return total_loss;
   }
-  return at::div(total_loss, valid_count);
+  return total_loss.div(valid_count);
 }
 
 // Naive CUDA implementation for small vocabularies
@@ -381,12 +391,17 @@ inline Tensor cast_grad_output_cuda(const Tensor& grad_output, const Tensor& inp
 }
 
 inline Tensor mask_invalid_rows_cuda(const Tensor& tensor, const Tensor& valid_mask) {
-  return tensor * valid_mask.to(tensor.scalar_type()).unsqueeze(1);
+  auto mask = valid_mask.to(tensor.scalar_type()).unsqueeze(1);
+  return at::mul(tensor, mask);
+}
+
+inline Tensor zeros_like_tensor_cuda(const Tensor& src) {
+  return at::_ops::zeros_like::call(src, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt);
 }
 
 inline Tensor zeros_like_or_undef_cuda(const std::optional<Tensor>& opt) {
   if (opt.has_value()) {
-    return at::zeros_like(opt.value());
+    return zeros_like_tensor_cuda(opt.value());
   }
   return Tensor();
 }
@@ -400,8 +415,9 @@ inline void apply_target_updates_cuda(
   if (rows.numel() == 0) {
     return;
   }
-  auto local_targets = at::sub(at::index_select(target_flat, 0, rows), offset).to(at::kLong);
-  auto gather = grad_chunk.index({rows, local_targets}) - (1.0 - label_smoothing);
+  auto selected_targets = at::index_select(target_flat, 0, rows);
+  auto local_targets = selected_targets.add(-offset).to(at::kLong);
+  auto gather = grad_chunk.index({rows, local_targets}).add(-(1.0 - label_smoothing));
   grad_chunk.index_put_({rows, local_targets}, gather);
 }
 
@@ -423,7 +439,7 @@ inline void scale_grad_chunk_cuda(
     grad_chunk.zero_();
     return;
   }
-  auto scale = grad_output_tensor / static_cast<double>(valid_count);
+  auto scale = grad_output_tensor.div(static_cast<double>(valid_count));
   grad_chunk.mul_(scale);
 }
 
@@ -447,8 +463,8 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
   const int64_t valid_count = valid_mask.sum().item<int64_t>();
 
   if (reduction == Reduction::Mean && valid_count == 0) {
-    Tensor grad_input = at::zeros_like(input);
-    Tensor grad_weight = at::zeros_like(weight);
+    Tensor grad_input = zeros_like_tensor_cuda(input);
+    Tensor grad_weight = zeros_like_tensor_cuda(weight);
     Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
     return {grad_input, grad_weight, grad_bias};
   }
@@ -471,16 +487,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
     auto logits_chunk = at::linear(input_flat, weight_chunk, bias_chunk);
     auto chunk_max = std::get<0>(logits_chunk.max(-1));
     auto new_max = at::maximum(running_max, chunk_max);
-    auto exp_scale_old = at::exp(running_max - new_max);
-    auto shifted_logits = logits_chunk - new_max.unsqueeze(-1);
+    auto exp_scale_old = at::exp(running_max.sub(new_max));
+    auto shifted_logits = logits_chunk.sub(new_max.unsqueeze(-1));
     auto exp_chunk = at::sum(at::exp(shifted_logits), {-1});
     exp_sums = at::add(at::mul(exp_sums, exp_scale_old), exp_chunk);
     running_max = new_max;
   }
 
-  Tensor logsumexp = running_max + exp_sums.log();
-  Tensor grad_input = at::zeros_like(input_flat);
-  Tensor grad_weight = at::zeros_like(weight);
+  Tensor logsumexp = running_max.add(exp_sums.log());
+  Tensor grad_input = zeros_like_tensor_cuda(input_flat);
+  Tensor grad_weight = zeros_like_tensor_cuda(weight);
   Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
 
   const double uniform_component = label_smoothing > 0.0 ? label_smoothing / static_cast<double>(vocab_size) : 0.0;
@@ -499,13 +515,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_vocabulary_chunking_cuda(
       bias_chunk = bias_opt->slice(0, start_idx, end_idx);
     }
     auto logits_chunk = at::linear(input_flat, weight_chunk, bias_chunk);
-    auto grad_chunk = at::exp(logits_chunk - logsumexp.unsqueeze(-1));
+    auto grad_chunk = at::exp(logits_chunk.sub(logsumexp.unsqueeze(-1)));
     if (label_smoothing > 0.0) {
-      grad_chunk = at::add(grad_chunk, -uniform_component);
+      grad_chunk = grad_chunk.add(-uniform_component);
     }
     grad_chunk = mask_invalid_rows_cuda(grad_chunk, valid_mask);
-    auto target_chunk_mask = valid_mask & (target_flat >= start_idx) & (target_flat < end_idx);
-    auto rows = at::nonzero(target_chunk_mask, /*as_tuple=*/false).squeeze(-1);
+    auto lower_bound = target_flat.ge(start_idx);
+    auto upper_bound = target_flat.lt(end_idx);
+    auto target_chunk_mask = at::logical_and(valid_mask, lower_bound);
+    target_chunk_mask = at::logical_and(target_chunk_mask, upper_bound);
+    auto rows = target_chunk_mask.nonzero().squeeze(-1);
     apply_target_updates_cuda(grad_chunk, target_flat, rows, start_idx, label_smoothing);
     scale_grad_chunk_cuda(grad_chunk, grad_output_tensor, grad_output_flat, reduction, valid_count);
     grad_chunk = mask_invalid_rows_cuda(grad_chunk, valid_mask);
@@ -538,14 +557,14 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
   const int64_t valid_count = valid_mask.sum().item<int64_t>();
 
   if (reduction == Reduction::Mean && valid_count == 0) {
-    Tensor grad_input = at::zeros_like(input);
-    Tensor grad_weight = at::zeros_like(weight);
+    Tensor grad_input = zeros_like_tensor_cuda(input);
+    Tensor grad_weight = zeros_like_tensor_cuda(weight);
     Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
     return {grad_input, grad_weight, grad_bias};
   }
 
-  Tensor grad_input = at::zeros_like(input_flat);
-  Tensor grad_weight = at::zeros_like(weight);
+  Tensor grad_input = zeros_like_tensor_cuda(input_flat);
+  Tensor grad_weight = zeros_like_tensor_cuda(weight);
   Tensor grad_bias = zeros_like_or_undef_cuda(bias_opt);
 
   Tensor grad_output_tensor = cast_grad_output_cuda(grad_output, input);
@@ -563,16 +582,16 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
     auto target_chunk = target_flat.narrow(0, start_idx, slice);
     auto valid_mask_chunk = valid_mask.narrow(0, start_idx, slice);
     auto logits_chunk = at::linear(input_chunk, weight, bias_opt);
-    auto logsumexp_chunk = at::logsumexp(logits_chunk, 1);
-    auto grad_chunk = at::exp(logits_chunk - logsumexp_chunk.unsqueeze(-1));
+    auto logsumexp_chunk = at::_ops::logsumexp::call(logits_chunk, std::vector<int64_t>{1}, false);
+    auto grad_chunk = at::exp(logits_chunk.sub(logsumexp_chunk.unsqueeze(-1)));
     if (label_smoothing > 0.0) {
-      grad_chunk = at::add(grad_chunk, -uniform_component);
+      grad_chunk = grad_chunk.add(-uniform_component);
     }
     grad_chunk = mask_invalid_rows_cuda(grad_chunk, valid_mask_chunk);
-    auto rows = at::nonzero(valid_mask_chunk, /*as_tuple=*/false).squeeze(-1);
+    auto rows = valid_mask_chunk.nonzero().squeeze(-1);
     if (rows.numel() > 0) {
       auto targets_slice = at::index_select(target_chunk, 0, rows).to(at::kLong);
-      auto gather = grad_chunk.index({rows, targets_slice}) - (1.0 - label_smoothing);
+      auto gather = grad_chunk.index({rows, targets_slice}).add(-(1.0 - label_smoothing));
       grad_chunk.index_put_({rows, targets_slice}, gather);
     }
     if (reduction == Reduction::None) {
@@ -583,7 +602,7 @@ inline std::tuple<Tensor, Tensor, Tensor> backward_batch_chunking_cuda(
       if (valid_count == 0) {
         continue;
       }
-      grad_chunk.mul_(grad_output_tensor / static_cast<double>(valid_count));
+      grad_chunk.mul_(grad_output_tensor.div(static_cast<double>(valid_count)));
     }
     grad_chunk = mask_invalid_rows_cuda(grad_chunk, valid_mask_chunk);
     grad_input.narrow(0, start_idx, slice).add_(grad_chunk.matmul(weight));
